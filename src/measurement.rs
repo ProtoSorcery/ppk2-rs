@@ -72,15 +72,13 @@ impl MeasurementAccumulator {
             let current_measurement_range = get_range(raw).min(4) as usize;
             let counter = get_counter(raw) as u8;
 
-            let prev_expected_counter = self.state.expected_counter;
-            // Wrap at 63 + 1
+            let expected = self.state.expected_counter;
             self.state.expected_counter.replace((counter + 1) & 0x3F);
-            if let Some(prev_count) = prev_expected_counter {
-                if prev_count < counter {
-                    samples_missed += (counter - prev_count) as usize;
-                    continue;
-                } else if prev_expected_counter > Some(counter) {
-                    samples_missed += (prev_count - counter) as usize;
+            if let Some(exp) = expected {
+                if counter != exp {
+                    // Number of samples skipped, mod 64
+                    let gap = (counter.wrapping_sub(exp)) & 0x3F;
+                    samples_missed += gap as usize;
                     continue;
                 }
             }
@@ -215,7 +213,7 @@ impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
             .enumerate()
             .filter(|(_, p)| *p > count / 2)
             .for_each(|(i, _)| pins[i] = true);
-        let avg = sum / (count - missed) as f32;
+        let avg = sum / count.saturating_sub(missed).max(1) as f32;
 
         MeasurementMatch::Match(Measurement {
             micro_amps: avg,
