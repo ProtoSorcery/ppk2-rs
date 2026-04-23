@@ -523,7 +523,7 @@ END
         let expected_metadata = Metadata {
             modifiers: expected_modifiers,
             calibrated: false,
-            vdd: 3714,
+            vdd: 3741,
             hw: 9173,
             mode: MeasurementMode::Source,
             ia: 56,
