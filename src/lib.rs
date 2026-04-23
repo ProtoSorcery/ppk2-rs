@@ -3,6 +3,7 @@
 
 use measurement::{MeasurementAccumulator, MeasurementIterExt, MeasurementMatch};
 use serialport::{ClearBuffer::Input, FlowControl, SerialPort};
+use std::io::Read;
 use std::str::Utf8Error;
 use std::sync::mpsc::{self, Receiver, SendError, TryRecvError};
 use std::{
@@ -11,7 +12,7 @@ use std::{
     io,
     sync::{Arc, Condvar, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use types::{DevicePower, LogicPortPins, MeasurementMode, Metadata, SourceVoltage};
@@ -78,6 +79,46 @@ impl Ppk2 {
             port,
             metadata: Metadata::default(),
         };
+
+        // A prior client may have crashed mid-stream, leaving the device
+        // emitting 4-byte measurement frames. GetMetaData's text response
+        // (terminated by "END\n") cannot be parsed out of that stream, so
+        // stop any in-progress averaging and drain stale bytes first.
+        if let Err(e) = ppk2.send_command(Command::AverageStop) {
+            tracing::debug!("AverageStop during recovery failed: {:?}", e);
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        let original_timeout = ppk2.port.timeout();
+        if let Err(e) = ppk2.port.set_timeout(Duration::from_millis(20)) {
+            tracing::debug!("failed to set drain timeout: {:?}", e);
+        }
+        let mut drained: usize = 0;
+        let mut scratch = [0u8; 256];
+        let drain_deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if Instant::now() >= drain_deadline {
+                break;
+            }
+            match ppk2.port.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(n) => drained += n,
+                Err(e)
+                    if e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!("drain read error: {:?}", e);
+                    break;
+                }
+            }
+        }
+        if let Err(e) = ppk2.port.set_timeout(original_timeout) {
+            tracing::debug!("failed to restore port timeout: {:?}", e);
+        }
+        tracing::debug!("drained {} stale bytes during recovery", drained);
 
         ppk2.metadata = ppk2.get_metadata()?;
         ppk2.set_power_mode(mode)?;
@@ -243,6 +284,18 @@ impl Ppk2 {
     fn set_power_mode(&mut self, mode: MeasurementMode) -> Result<()> {
         self.send_command(Command::SetPowerMode(mode))?;
         Ok(())
+    }
+}
+
+impl Drop for Ppk2 {
+    fn drop(&mut self) {
+        // Best-effort quiesce: stop any streaming and clear buffers so the
+        // next client sees a clean line. Failures are expected if the port
+        // is already closed or the device is unplugged - swallow them.
+        let _ = self
+            .port
+            .write_all(&Vec::from_iter(Command::AverageStop.bytes()));
+        let _ = self.port.clear(serialport::ClearBuffer::All);
     }
 }
 
