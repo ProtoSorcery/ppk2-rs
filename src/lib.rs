@@ -25,6 +25,23 @@ pub mod types;
 
 const SPS_MAX: usize = 100_000;
 
+/// Size of the reusable USB read buffer for the measurement worker, in bytes.
+///
+/// The PPK2 emits one 4-byte sample per measurement and streams ~100,000
+/// samples/sec (~400 KB/s) at the highest rate. Previously the worker read with
+/// a 4-byte buffer, forcing roughly one trapping `read()` syscall per sample
+/// (~1M syscalls/sec). The parser (`MeasurementAccumulator::feed_into`) already
+/// tolerates arbitrary byte counts via an internal partial-sample remainder, so
+/// we read up to this many bytes per syscall instead, collapsing the syscall
+/// count by ~16000x at 64 KB.
+///
+/// `serialport::SerialPort::read` follows `std::io::Read` semantics: it returns
+/// as many bytes as are currently available (up to the buffer length) once at
+/// least one byte has arrived or the timeout elapses — it does NOT block waiting
+/// to fill the whole buffer. So a large buffer adds no latency; short reads
+/// simply return fewer bytes, and we feed only the bytes actually read.
+const USB_READ_BUF_BYTES: usize = 64 * 1024;
+
 #[derive(Error, Debug)]
 /// PPK2 communication or data parsing error.
 #[allow(missing_docs)]
@@ -221,13 +238,14 @@ impl Ppk2 {
                     .wait_while(lock.lock().unwrap(), |ready| !*ready)
                     .unwrap();
 
-                /* 4 bytes is the size of a single sample, and the PPK pushes 100,000 samples per second.
-                   Having size of `buf` at eg.1024 blocks port.read() until the buffer is full with 1024 bytes (128 samples).
-                   The measurement returned will be the average of the 128 samples. But we want to get every single sample when
-                   requested sps is 100,000. Hence, we set the buffer size to 4 bytes, and read the port in a loop,
-                   feeding the accumulator with the data.
+                /* A single PPK2 sample is 4 bytes and the device streams up to 100,000 samples/sec.
+                   We read up to USB_READ_BUF_BYTES per `read()` into a reusable buffer and feed the
+                   exact number of bytes returned to the accumulator. `port.read()` returns whatever
+                   bytes are currently available (it does NOT wait to fill the buffer), so a large
+                   buffer only reduces syscall count without adding latency. The accumulator carries a
+                   partial-sample remainder internally, so feeding any byte count is correctness-preserving.
                 */
-                let mut buf = [0u8; 4];
+                let mut buf = [0u8; USB_READ_BUF_BYTES];
                 let mut measurement_buf = VecDeque::with_capacity(SPS_MAX);
                 let mut missed = 0;
                 loop {
