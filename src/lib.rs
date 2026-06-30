@@ -32,15 +32,17 @@ const SPS_MAX: usize = 100_000;
 /// a 4-byte buffer, forcing roughly one trapping `read()` syscall per sample
 /// (~1M syscalls/sec). The parser (`MeasurementAccumulator::feed_into`) already
 /// tolerates arbitrary byte counts via an internal partial-sample remainder, so
-/// we read up to this many bytes per syscall instead, collapsing the syscall
-/// count by ~16000x at 64 KB.
+/// we batch the read to cut the syscall count.
 ///
-/// `serialport::SerialPort::read` follows `std::io::Read` semantics: it returns
-/// as many bytes as are currently available (up to the buffer length) once at
-/// least one byte has arrived or the timeout elapses — it does NOT block waiting
-/// to fill the whole buffer. So a large buffer adds no latency; short reads
-/// simply return fewer bytes, and we feed only the bytes actually read.
-const USB_READ_BUF_BYTES: usize = 64 * 1024;
+/// We use a MODEST 4 KB buffer (≈ one USB transfer). A Phase-0 parser bench
+/// showed parse CPU plateaus by ~256 B, so 4 KB already captures essentially
+/// all of the syscall-reduction benefit. Crucially, read size no longer affects
+/// the decimated output: the streaming drain in `start_measurement_matching`
+/// emits in FIXED `SPS_MAX/sps`-sample chunks (see the `while measurement_buf...`
+/// loop), so averaging is independent of how many bytes each `read()` returns.
+/// A huge buffer (the prior 64 KB) is avoided pending live read-latency
+/// verification; 4 KB keeps latency bounded while still collapsing syscalls.
+const USB_READ_BUF_BYTES: usize = 4 * 1024;
 
 #[derive(Error, Debug)]
 /// PPK2 communication or data parsing error.
@@ -241,9 +243,16 @@ impl Ppk2 {
                 /* A single PPK2 sample is 4 bytes and the device streams up to 100,000 samples/sec.
                    We read up to USB_READ_BUF_BYTES per `read()` into a reusable buffer and feed the
                    exact number of bytes returned to the accumulator. `port.read()` returns whatever
-                   bytes are currently available (it does NOT wait to fill the buffer), so a large
+                   bytes are currently available (it does NOT wait to fill the buffer), so a larger
                    buffer only reduces syscall count without adding latency. The accumulator carries a
                    partial-sample remainder internally, so feeding any byte count is correctness-preserving.
+
+                   The driver decimates by AVERAGING `SPS_MAX/sps` parsed samples into one output via
+                   `combine_matching`. The drain below pulls samples in FIXED `chunk`-sized units in a
+                   while-loop, so each emitted measurement always averages exactly `chunk` samples
+                   regardless of how many bytes the last `read()` delivered. Leftover samples
+                   (< chunk) stay in `measurement_buf` for the next read. This decouples the averaging
+                   window from the USB read size — read buffer size never changes decimated output.
                 */
                 let mut buf = [0u8; USB_READ_BUF_BYTES];
                 let mut measurement_buf = VecDeque::with_capacity(SPS_MAX);
@@ -260,9 +269,12 @@ impl Ppk2 {
                     // Now we read chunks and feed them to the accumulator
                     let n = port.read(&mut buf)?;
                     missed += accumulator.feed_into(&buf[..n], &mut measurement_buf);
-                    let len = measurement_buf.len();
-                    if len >= SPS_MAX / sps {
-                        let measurement = measurement_buf.drain(..).combine_matching(missed, pins);
+                    // Emit in fixed-size decimation units so each averaged output
+                    // covers exactly `chunk` samples regardless of read size.
+                    let chunk = (SPS_MAX / sps).max(1);
+                    while measurement_buf.len() >= chunk {
+                        let measurement =
+                            measurement_buf.drain(..chunk).combine_matching(missed, pins);
                         meas_tx.send(measurement)?;
                         missed = 0;
                     }
