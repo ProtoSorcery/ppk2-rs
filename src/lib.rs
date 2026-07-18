@@ -311,7 +311,19 @@ impl Ppk2 {
         Ok(())
     }
 
-    fn set_power_mode(&mut self, mode: MeasurementMode) -> Result<()> {
+    /// Change the measurement mode (source-meter vs. ampere-meter) on a live,
+    /// already-open handle without reopening the device.
+    ///
+    /// # Must be called while measurements are stopped
+    ///
+    /// This issues a `SetPowerMode` command directly and does not coordinate
+    /// with the streaming data-receive thread. It must therefore only be called
+    /// while no measurement stream is running — i.e. on the handle returned by
+    /// the `stop` closure of [`Ppk2::start_measurement`] (which has joined the
+    /// receive thread and stopped averaging). Calling it during an active
+    /// stream would race the measurement handshake and corrupt the sample
+    /// stream. The internal command handshake is otherwise unchanged.
+    pub fn set_power_mode(&mut self, mode: MeasurementMode) -> Result<()> {
         self.send_command(Command::SetPowerMode(mode))?;
         Ok(())
     }
