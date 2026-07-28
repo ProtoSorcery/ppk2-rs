@@ -23,7 +23,17 @@ pub mod cmd;
 pub mod measurement;
 pub mod types;
 
-const SPS_MAX: usize = 100_000;
+/// The device's raw hardware sample rate, in samples/sec.
+///
+/// The PPK2 always streams at this rate; requesting a lower `sps` decimates by
+/// AVERAGING `chunk = SPS_MAX / sps` raw samples into one emitted
+/// [`measurement::MeasurementMatch`].
+///
+/// This is also the unit in which [`measurement::MeasurementMatch`]'s `missed`
+/// counts are expressed: `missed` counts RAW samples at `SPS_MAX`, not
+/// decimated output periods. Consumers should compute
+/// `chunk = SPS_MAX / sps` from this constant rather than hardcoding 100_000.
+pub const SPS_MAX: usize = 100_000;
 
 /// Size of the reusable USB read buffer for the measurement worker, in bytes.
 ///
@@ -271,6 +281,18 @@ impl Ppk2 {
                     missed += accumulator.feed_into(&buf[..n], &mut measurement_buf);
                     // Emit in fixed-size decimation units so each averaged output
                     // covers exactly `chunk` samples regardless of read size.
+                    //
+                    // INVARIANT (consumers depend on this — do not break it):
+                    // summing the `missed` field of EVERY emitted
+                    // `MeasurementMatch` yields the exact total number of raw
+                    // samples the device skipped, with no double-counting and
+                    // no silent loss. That holds because `missed` accumulates
+                    // across reads while nothing is emitted, is handed to
+                    // `combine_matching` (which propagates it into BOTH the
+                    // `Match` and `NoMatch` variants), and is reset to 0 ONLY
+                    // after a successful send. Any future edit that resets,
+                    // skips, or conditionally forwards `missed` will make
+                    // consumers' synthesized timelines drift early.
                     let chunk = (SPS_MAX / sps).max(1);
                     while measurement_buf.len() >= chunk {
                         let measurement =

@@ -105,11 +105,17 @@ fn main() -> Result<()> {
         count += 1;
         use MeasurementMatch::*;
         match rcv_res {
-            Ok(Match(m)) => {
-                debug!("Last chunk average: {:.4} μA", m.micro_amps);
+            Ok(Match {
+                measurement,
+                missed,
+            }) => {
+                debug!(
+                    "Last chunk average: {:.4} μA ({missed} raw samples skipped)",
+                    measurement.micro_amps
+                );
             }
-            Ok(NoMatch) => {
-                debug!("No match in the last chunk of measurements");
+            Ok(NoMatch { missed }) => {
+                debug!("No match in the last chunk of measurements ({missed} raw samples skipped)");
             }
             Err(RecvTimeoutError::Disconnected) => break Ok(()),
             Err(e) => {

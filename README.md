@@ -6,7 +6,7 @@ Heavily based on [nrfconnect-ppk](https://github.com/NordicSemiconductor/pc-nrfc
 
 To install, run:
 
-```
+```sh
 cargo install ppk2-cli
 ```
 

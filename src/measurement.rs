@@ -160,13 +160,49 @@ fn get_adc_result(
     adc
 }
 
-/// Indicates whether a set of [Measurement]s matched
+/// Indicates whether a set of [Measurement]s matched.
+///
+/// Both variants carry a `missed` count so that a consumer can reconstruct a
+/// correct timeline even when the device dropped samples. See the per-variant
+/// docs for the exact units.
 #[derive(Debug)]
 pub enum MeasurementMatch {
     /// A set of [Measurement]s did match
-    Match(Measurement),
+    Match {
+        /// The combined (averaged) measurement for this chunk.
+        measurement: Measurement,
+        /// Number of RAW device samples that were skipped (detected via a
+        /// sample-counter gap) since the previous emitted [MeasurementMatch].
+        ///
+        /// **Units are raw device samples at `SPS_MAX`, not decimated output
+        /// periods.** A consumer decimating by `chunk = SPS_MAX / sps` must
+        /// divide by `chunk` to convert to output periods. A consumer that
+        /// synthesizes timestamps from a sample index MUST advance that index
+        /// by these skipped periods, or its timeline will run progressively
+        /// early.
+        missed: u32,
+    },
     /// No matching [Measurement]s in the last chunk
-    NoMatch,
+    NoMatch {
+        /// Number of RAW device samples that were skipped (detected via a
+        /// sample-counter gap) since the previous emitted [MeasurementMatch].
+        ///
+        /// **Units are raw device samples at `SPS_MAX`, not decimated output
+        /// periods.** A consumer decimating by `chunk = SPS_MAX / sps` must
+        /// divide by `chunk` to convert to output periods. A consumer that
+        /// synthesizes timestamps from a sample index MUST advance that index
+        /// by these skipped periods, or its timeline will run progressively
+        /// early.
+        missed: u32,
+    },
+}
+
+/// Saturating cast of an accumulated skipped-sample count to the wire width.
+///
+/// Never panics: counts beyond `u32::MAX` (which would require ~12 hours of a
+/// fully-dropped 100 kHz stream between two emitted measurements) clamp instead.
+fn saturating_missed(missed: usize) -> u32 {
+    u32::try_from(missed).unwrap_or(u32::MAX)
 }
 
 /// Extension trait for VecDeque<Measurement>
@@ -175,12 +211,34 @@ pub trait MeasurementIterExt {
     /// If there are none, [MeasurementMatch::NoMatch] is returned.
     /// Set combined logic port pin high if and only if more than half
     /// of the measurements indicate the pin was high
+    ///
+    /// `missed` is the number of RAW device samples that were skipped (detected
+    /// via a sample-counter gap) since the previous emitted [MeasurementMatch].
+    /// **Units are raw device samples at `SPS_MAX`, not decimated output
+    /// periods.** A consumer decimating by `chunk = SPS_MAX / sps` must divide
+    /// by `chunk` to convert to output periods. A consumer that synthesizes
+    /// timestamps from a sample index MUST advance that index by these skipped
+    /// periods, or its timeline will run progressively early. The value is
+    /// propagated verbatim into the returned variant (saturating at
+    /// [`u32::MAX`]), including on the empty-input path, so no pending count is
+    /// ever silently dropped.
     fn combine(self, missed: usize) -> MeasurementMatch;
 
     /// Combine items with matching logic port state into a single [MeasurementMatch::Match],
     /// if there are items. If there are none, [MeasurementMatch::NoMatch] is returned.
     /// Set combined logic port pin high if and only if more than half
     /// of the measurements indicate the pin was high
+    ///
+    /// `missed` is the number of RAW device samples that were skipped (detected
+    /// via a sample-counter gap) since the previous emitted [MeasurementMatch].
+    /// **Units are raw device samples at `SPS_MAX`, not decimated output
+    /// periods.** A consumer decimating by `chunk = SPS_MAX / sps` must divide
+    /// by `chunk` to convert to output periods. A consumer that synthesizes
+    /// timestamps from a sample index MUST advance that index by these skipped
+    /// periods, or its timeline will run progressively early. The value is
+    /// propagated verbatim into the returned variant (saturating at
+    /// [`u32::MAX`]), including on the empty-input path, so no pending count is
+    /// ever silently dropped.
     fn combine_matching(self, missed: usize, matching_pins: LogicPortPins) -> MeasurementMatch;
 }
 
@@ -201,8 +259,12 @@ impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
         });
 
         if count == 0 {
-            // No measurements
-            return MeasurementMatch::NoMatch;
+            // No measurements. The pending skipped-sample count MUST still be
+            // reported here — dropping it on this path would silently lose
+            // elapsed-but-sampleless time from the consumer's timeline.
+            return MeasurementMatch::NoMatch {
+                missed: saturating_missed(missed),
+            };
         }
 
         // Set combined pin high if and only if more than half
@@ -213,12 +275,19 @@ impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
             .enumerate()
             .filter(|(_, p)| *p > count / 2)
             .for_each(|(i, _)| pins[i] = true);
+        // NOTE: this averaging denominator is deliberately left exactly as-is.
+        // Subtracting `missed` from `count` is questionable (it inflates the
+        // average), but changing it would alter measured current values, which
+        // is out of scope for propagating the skipped-sample count.
         let avg = sum / count.saturating_sub(missed).max(1) as f32;
 
-        MeasurementMatch::Match(Measurement {
-            micro_amps: avg,
-            pins: pins.into(),
-        })
+        MeasurementMatch::Match {
+            measurement: Measurement {
+                micro_amps: avg,
+                pins: pins.into(),
+            },
+            missed: saturating_missed(missed),
+        }
     }
 
     fn combine_matching(self, missed: usize, matching_pins: LogicPortPins) -> MeasurementMatch {

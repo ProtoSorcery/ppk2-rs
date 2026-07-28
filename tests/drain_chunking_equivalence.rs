@@ -28,10 +28,10 @@ use ppk2::measurement::{
     Measurement, MeasurementAccumulator, MeasurementIterExt, MeasurementMatch,
 };
 use ppk2::types::{LogicPortPins, Metadata};
-
-/// Device hardware sample rate (samples/sec). Matches the private `SPS_MAX`
-/// constant in `src/lib.rs`; the decimation chunk size is `SPS_MAX / sps`.
-const SPS_MAX: usize = 100_000;
+/// Device hardware sample rate (samples/sec); the decimation chunk size is
+/// `SPS_MAX / sps`. Re-exported from the crate so this test cannot drift from
+/// production.
+use ppk2::SPS_MAX;
 
 /// Number of synthetic 4-byte frames in the stream. Enough to produce many
 /// decimated outputs at chunk=10 while keeping the test fast.
@@ -80,9 +80,10 @@ fn build_stream() -> Vec<u8> {
 }
 
 /// A `MeasurementMatch` reduced to a bit-comparable form. `MeasurementMatch`
-/// has no `PartialEq`, so we compare exact float bits + the 8-bit pin bitmask.
-/// `None` represents `MeasurementMatch::NoMatch`.
-type EmittedMatch = Option<(u32, u8)>;
+/// has no `PartialEq`, so we compare exact float bits + the 8-bit pin bitmask,
+/// paired with the variant's skipped-raw-sample count.
+/// `None` in the first slot represents `MeasurementMatch::NoMatch`.
+type EmittedMatch = (Option<(u32, u8)>, u32);
 
 fn pin_mask(m: &Measurement) -> u8 {
     let mut mask = 0u8;
@@ -96,8 +97,14 @@ fn pin_mask(m: &Measurement) -> u8 {
 
 fn reduce(m: MeasurementMatch) -> EmittedMatch {
     match m {
-        MeasurementMatch::Match(meas) => Some((meas.micro_amps.to_bits(), pin_mask(&meas))),
-        MeasurementMatch::NoMatch => None,
+        MeasurementMatch::Match {
+            measurement,
+            missed,
+        } => (
+            Some((measurement.micro_amps.to_bits(), pin_mask(&measurement))),
+            missed,
+        ),
+        MeasurementMatch::NoMatch { missed } => (None, missed),
     }
 }
 
