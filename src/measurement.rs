@@ -137,8 +137,20 @@ fn get_adc_result(
 
     state.prev_range.get_or_insert(range);
 
+    // Range-switch spike filter. Mirrors Nordic's `SerialDevice.getAdcResult()`
+    // in pc-nrfconnect-ppk: when the hardware switches shunt resistors the analog
+    // front end needs a few samples to settle, so the raw ADC reading is replaced
+    // by the rolling average for SPIKE_FILTER_SAMPLES samples after the switch.
+    //
+    // The inner test MUST be the same inequality as the outer one
+    // (`prev_range != range`, i.e. "the range just changed"). Negating it here
+    // makes `after_spike` monotonically decreasing, so it never becomes positive,
+    // the hold is never armed, and only the single switch sample is filtered --
+    // letting the remaining settling samples leak through as near-zero dips. It
+    // also leaves `consecutive_range_sample` never reset, permanently disabling
+    // the range-4 rolling-average restore below.
     if !matches!(state.prev_range, Some(r) if r == range) || state.after_spike > 0 {
-        if matches!(state.prev_range, Some(r) if r == range) {
+        if !matches!(state.prev_range, Some(r) if r == range) {
             state.consecutive_range_sample = 0;
             state.after_spike = SPIKE_FILTER_SAMPLES;
         } else {
@@ -322,13 +334,11 @@ masked_value!(get_logic, 8, 24);
 #[cfg(test)]
 mod tests {
     use crate::{
-        measurement::{get_adc_result, AccumulatorState},
+        measurement::{get_adc_result, AccumulatorState, SPIKE_FILTER_ALPHA, SPIKE_FILTER_SAMPLES},
         types::Metadata,
     };
 
-    #[test]
-    #[allow(clippy::excessive_precision)]
-    pub fn test_get_adc_result() {
+    fn test_metadata() -> Metadata {
         let raw_metadata = r#"Calibrated: 0
 R0: 1003.3506
 R1: 101.5865
@@ -371,8 +381,45 @@ UG4: 1.00
 IA: 56
 END
 "#;
-        let metadata =
-            Metadata::from_bytes(raw_metadata.as_bytes()).expect("Error parsing metadata");
+        Metadata::from_bytes(raw_metadata.as_bytes()).expect("Error parsing metadata")
+    }
+
+    /// Push `adc_val` through [get_adc_result] with the spike filter guaranteed
+    /// to be inactive, yielding the unfiltered current in µA for that raw value.
+    fn unfiltered_micro_amps(metadata: &Metadata, range: usize, adc_val: u32) -> f32 {
+        let mut scratch = AccumulatorState {
+            rolling_avg_4: None,
+            rolling_avg: None,
+            // prev_range == range and after_spike == 0 => filter branch not taken.
+            prev_range: Some(range),
+            after_spike: 0,
+            consecutive_range_sample: 0,
+            expected_counter: None,
+        };
+        get_adc_result(metadata, &mut scratch, range, adc_val) * 10f32.powi(6)
+    }
+
+    /// Find the raw ADC value that reads closest to `target_micro_amps` in `range`.
+    ///
+    /// The forward transfer function is monotonically increasing in `adc_val`
+    /// over the representable window, so a plain binary search converges.
+    fn raw_for_micro_amps(metadata: &Metadata, range: usize, target_micro_amps: f32) -> u32 {
+        let (mut lo, mut hi) = (0u32, 0x3FFFu32 * 4);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if unfiltered_micro_amps(metadata, range, mid) < target_micro_amps {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    pub fn test_get_adc_result() {
+        let metadata = test_metadata();
 
         let mut state = AccumulatorState {
             rolling_avg_4: Some(9.478947833765696e-8),
@@ -388,5 +435,99 @@ END
 
         // JS result: 0.021454880761611544
         assert!((adc_result - 0.021454880761611544).abs() < f32::EPSILON)
+    }
+
+    /// The spike filter must suppress the full settling transient after a
+    /// measurement-range switch, not just the single sample on which the switch
+    /// was observed.
+    ///
+    /// Regression test for an inverted inner condition in [get_adc_result] that
+    /// made `after_spike` never arm: only the switch sample was replaced by the
+    /// rolling average, and the remaining `SPIKE_FILTER_SAMPLES - 1` settling
+    /// samples leaked through raw as spurious near-zero dips.
+    #[test]
+    fn spike_filter_suppresses_full_settling_window() {
+        let metadata = test_metadata();
+
+        // Steady pre-switch level, comfortably inside range 0.
+        let steady_range0 = raw_for_micro_amps(&metadata, 0, 650.0);
+        // Settling transient right after the shunt switch: the analog front end
+        // reads near zero, then recovers towards the true post-switch level.
+        let corrupt: [u32; 3] = [
+            raw_for_micro_amps(&metadata, 2, 120.0),
+            raw_for_micro_amps(&metadata, 2, 60.0),
+            raw_for_micro_amps(&metadata, 2, 900.0),
+        ];
+        let settled_range2 = raw_for_micro_amps(&metadata, 2, 3000.0);
+
+        let mut state = AccumulatorState {
+            rolling_avg_4: None,
+            rolling_avg: None,
+            prev_range: None,
+            after_spike: 0,
+            consecutive_range_sample: 0,
+            expected_counter: None,
+        };
+
+        // --- Steady run in range 0: rolling averages converge to the level.
+        let mut pre_switch = 0.0f32;
+        for _ in 0..8 {
+            pre_switch = get_adc_result(&metadata, &mut state, 0, steady_range0) * 10f32.powi(6);
+        }
+        assert!(
+            (pre_switch - 650.0).abs() < 1.0,
+            "steady range-0 run should read ~650 µA, got {pre_switch}"
+        );
+
+        // Worst case the smoothed output can reach while held: every one of the
+        // SPIKE_FILTER_SAMPLES settling samples reads exactly zero.
+        let floor = pre_switch * (1.0 - SPIKE_FILTER_ALPHA).powi(SPIKE_FILTER_SAMPLES as i32);
+
+        // Track what the rolling average should be, independently of the impl.
+        let mut expected_avg = pre_switch;
+
+        // --- Step to range 2. The 3 corrupt samples must all be replaced.
+        for (i, &raw) in corrupt.iter().enumerate() {
+            let raw_micro_amps = unfiltered_micro_amps(&metadata, 2, raw);
+            expected_avg =
+                SPIKE_FILTER_ALPHA * raw_micro_amps + (1.0 - SPIKE_FILTER_ALPHA) * expected_avg;
+
+            let out = get_adc_result(&metadata, &mut state, 2, raw) * 10f32.powi(6);
+
+            assert!(
+                (out - expected_avg).abs() < 1.0,
+                "post-switch sample {i} must be replaced by the rolling average \
+                 ({expected_avg} µA), got {out} µA (raw was {raw_micro_amps} µA)"
+            );
+            assert!(
+                out > floor,
+                "post-switch sample {i} dipped to {out} µA, below the smoothing \
+                 floor of {floor} µA -- a raw settling sample leaked through"
+            );
+
+            if i == 0 {
+                // The switch sample must reset the consecutive-sample counter,
+                // otherwise the range-4 rolling-average restore is permanently
+                // disabled after the second range change of a session.
+                assert_eq!(
+                    state.consecutive_range_sample, 0,
+                    "consecutive_range_sample must reset to 0 on a range change"
+                );
+                assert_eq!(
+                    state.after_spike,
+                    SPIKE_FILTER_SAMPLES - 1,
+                    "the spike hold must be armed on a range change"
+                );
+            }
+        }
+
+        // --- Hold expires: settled samples pass through unfiltered again.
+        let expected_settled = unfiltered_micro_amps(&metadata, 2, settled_range2);
+        let settled = get_adc_result(&metadata, &mut state, 2, settled_range2) * 10f32.powi(6);
+        assert!(
+            (settled - expected_settled).abs() < 1.0,
+            "once the hold expires the raw sample must pass through \
+             ({expected_settled} µA), got {settled} µA"
+        );
     }
 }
