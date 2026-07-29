@@ -108,14 +108,23 @@ fn main() -> Result<()> {
             Ok(Match {
                 measurement,
                 missed,
+                read_at,
             }) => {
+                // `read_at` is when the USB read that carried this chunk
+                // returned — an upper bound on capture time, not capture time.
+                let queued_for = read_at.elapsed().unwrap_or_default().as_micros();
                 debug!(
-                    "Last chunk average: {:.4} μA ({missed} raw samples skipped)",
+                    "Last chunk average: {:.4} μA ({missed} raw samples skipped, \
+                     {queued_for} μs since the USB read returned)",
                     measurement.micro_amps
                 );
             }
-            Ok(NoMatch { missed }) => {
-                debug!("No match in the last chunk of measurements ({missed} raw samples skipped)");
+            Ok(NoMatch { missed, read_at }) => {
+                let queued_for = read_at.elapsed().unwrap_or_default().as_micros();
+                debug!(
+                    "No match in the last chunk of measurements ({missed} raw samples \
+                     skipped, {queued_for} μs since the USB read returned)"
+                );
             }
             Err(RecvTimeoutError::Disconnected) => break Ok(()),
             Err(e) => {

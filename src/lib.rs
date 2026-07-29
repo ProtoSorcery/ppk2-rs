@@ -12,7 +12,7 @@ use std::{
     io,
     sync::{Arc, Condvar, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
 use types::{DevicePower, LogicPortPins, MeasurementMode, Metadata, SourceVoltage};
@@ -278,6 +278,15 @@ impl Ppk2 {
 
                     // Now we read chunks and feed them to the accumulator
                     let n = port.read(&mut buf)?;
+                    // Stamp the wall clock the INSTANT the read returns, before
+                    // parsing and before anything is queued. This is the whole
+                    // point of the field: it is an upper bound on the capture
+                    // time of the samples in `buf[..n]` that excludes the mpsc
+                    // queueing delay and the consumer's own scheduling. Doing
+                    // this any later (in the consumer, on dequeue) folds in tens
+                    // of milliseconds of scheduling jitter and destroys the
+                    // estimate. Do NOT move this below `feed_into`.
+                    let read_at = SystemTime::now();
                     missed += accumulator.feed_into(&buf[..n], &mut measurement_buf);
                     // Emit in fixed-size decimation units so each averaged output
                     // covers exactly `chunk` samples regardless of read size.
@@ -293,10 +302,24 @@ impl Ppk2 {
                     // after a successful send. Any future edit that resets,
                     // skips, or conditionally forwards `missed` will make
                     // consumers' synthesized timelines drift early.
+                    //
+                    // `read_at` is orthogonal to that accounting: it is stamped
+                    // per READ and forwarded to every chunk emitted from this
+                    // iteration, so it neither contributes to nor is consumed by
+                    // the `missed` sum above.
+                    //
+                    // Note a chunk can SPAN two reads: leftover samples below
+                    // `chunk` stay in `measurement_buf` and are completed by the
+                    // next read, and such a chunk is emitted here with the LATER
+                    // (current) read's `read_at`. That is intentional — see the
+                    // field docs on `MeasurementMatch::Match::read_at`. The
+                    // stamp must never under-state arrival, so the later read
+                    // is the correct one to attribute.
                     let chunk = (SPS_MAX / sps).max(1);
                     while measurement_buf.len() >= chunk {
-                        let measurement =
-                            measurement_buf.drain(..chunk).combine_matching(missed, pins);
+                        let measurement = measurement_buf
+                            .drain(..chunk)
+                            .combine_matching(missed, read_at, pins);
                         meas_tx.send(measurement)?;
                         missed = 0;
                     }

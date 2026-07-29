@@ -28,6 +28,7 @@
 //!   cargo test --test missed_sample_accounting -- --nocapture
 
 use std::collections::VecDeque;
+use std::time::{Duration, SystemTime};
 
 use ppk2::measurement::{
     Measurement, MeasurementAccumulator, MeasurementIterExt, MeasurementMatch,
@@ -113,15 +114,20 @@ fn run(stream: &[u8], metadata: &Metadata, read_size: usize, sps: usize) -> (u64
     let mut missed_total = 0u64;
     let mut emitted = 0usize;
 
-    for read in stream.chunks(read_size) {
+    for (read_index, read) in stream.chunks(read_size).enumerate() {
+        // Production stamps `SystemTime::now()` here, immediately after
+        // `read()` returns. A synthetic stamp keeps this test deterministic; it
+        // is irrelevant to the `missed` accounting, which is exactly what this
+        // test pins down — threading `read_at` through must not perturb it.
+        let read_at = SystemTime::UNIX_EPOCH + Duration::from_micros(read_index as u64);
         missed += acc.feed_into(read, &mut measurement_buf);
         while measurement_buf.len() >= chunk {
             let m = measurement_buf
                 .drain(..chunk)
-                .combine_matching(missed, pins);
+                .combine_matching(missed, read_at, pins);
             missed_total += match m {
                 MeasurementMatch::Match { missed, .. } => u64::from(missed),
-                MeasurementMatch::NoMatch { missed } => u64::from(missed),
+                MeasurementMatch::NoMatch { missed, .. } => u64::from(missed),
             };
             emitted += 1;
             missed = 0;
@@ -165,8 +171,8 @@ fn missed_survives_the_empty_input_path() {
     // A chunk in which NOTHING matched must still report the pending count;
     // dropping it here would silently lose elapsed-but-sampleless time.
     let empty: Vec<Measurement> = Vec::new();
-    match empty.into_iter().combine(42) {
-        MeasurementMatch::NoMatch { missed } => assert_eq!(missed, 42),
+    match empty.into_iter().combine(42, SystemTime::UNIX_EPOCH) {
+        MeasurementMatch::NoMatch { missed, .. } => assert_eq!(missed, 42),
         MeasurementMatch::Match { .. } => panic!("expected NoMatch for an empty chunk"),
     }
 }
@@ -189,9 +195,9 @@ fn missed_survives_the_pin_filtered_path() {
     let require_all_high: LogicPortPins = [true; 8].into();
     match measurements
         .into_iter()
-        .combine_matching(7, require_all_high)
+        .combine_matching(7, SystemTime::UNIX_EPOCH, require_all_high)
     {
-        MeasurementMatch::NoMatch { missed } => assert_eq!(missed, 7),
+        MeasurementMatch::NoMatch { missed, .. } => assert_eq!(missed, 7),
         MeasurementMatch::Match { .. } => panic!("expected NoMatch when no pins match"),
     }
 }

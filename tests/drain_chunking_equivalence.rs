@@ -23,6 +23,7 @@
 //!   cargo test --test drain_chunking_equivalence -- --nocapture
 
 use std::collections::VecDeque;
+use std::time::{Duration, SystemTime};
 
 use ppk2::measurement::{
     Measurement, MeasurementAccumulator, MeasurementIterExt, MeasurementMatch,
@@ -83,6 +84,13 @@ fn build_stream() -> Vec<u8> {
 /// has no `PartialEq`, so we compare exact float bits + the 8-bit pin bitmask,
 /// paired with the variant's skipped-raw-sample count.
 /// `None` in the first slot represents `MeasurementMatch::NoMatch`.
+///
+/// `read_at` is deliberately EXCLUDED from this comparison. It is stamped per
+/// USB `read()`, so it legitimately differs between read sizes: the same
+/// sample stream split into 4-byte reads produces a thousand times more
+/// distinct stamps than the same stream split into 4096-byte reads. Only the
+/// MEASUREMENT output is required to be read-size independent. `read_at`'s own
+/// behaviour is pinned down in `tests/read_timestamp_propagation.rs`.
 type EmittedMatch = (Option<(u32, u8)>, u32);
 
 fn pin_mask(m: &Measurement) -> u8 {
@@ -100,11 +108,12 @@ fn reduce(m: MeasurementMatch) -> EmittedMatch {
         MeasurementMatch::Match {
             measurement,
             missed,
+            read_at: _,
         } => (
             Some((measurement.micro_amps.to_bits(), pin_mask(&measurement))),
             missed,
         ),
-        MeasurementMatch::NoMatch { missed } => (None, missed),
+        MeasurementMatch::NoMatch { missed, read_at: _ } => (None, missed),
     }
 }
 
@@ -122,10 +131,17 @@ fn run(stream: &[u8], metadata: &Metadata, read_size: usize, sps: usize) -> Vec<
     let mut emitted: Vec<EmittedMatch> = Vec::new();
     let mut missed = 0;
 
-    for read in stream.chunks(read_size) {
+    for (read_index, read) in stream.chunks(read_size).enumerate() {
+        // Production stamps `SystemTime::now()` here, immediately after
+        // `read()` returns. A synthetic monotonically increasing stamp keeps
+        // this test deterministic; the value is not compared across read sizes
+        // (see `EmittedMatch`).
+        let read_at = SystemTime::UNIX_EPOCH + Duration::from_micros(read_index as u64);
         missed += acc.feed_into(read, &mut measurement_buf);
         while measurement_buf.len() >= chunk {
-            let m = measurement_buf.drain(..chunk).combine_matching(missed, pins);
+            let m = measurement_buf
+                .drain(..chunk)
+                .combine_matching(missed, read_at, pins);
             emitted.push(reduce(m));
             missed = 0;
         }

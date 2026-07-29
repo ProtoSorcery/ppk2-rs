@@ -1,6 +1,7 @@
 //! Measurement parsing and preprocessing
 
 use std::collections::VecDeque;
+use std::time::SystemTime;
 
 use crate::types::{LogicPortPins, Metadata};
 
@@ -175,8 +176,9 @@ fn get_adc_result(
 /// Indicates whether a set of [Measurement]s matched.
 ///
 /// Both variants carry a `missed` count so that a consumer can reconstruct a
-/// correct timeline even when the device dropped samples. See the per-variant
-/// docs for the exact units.
+/// correct timeline even when the device dropped samples, and a `read_at`
+/// wall-clock stamp so that a consumer can bound how late that timeline is.
+/// See the per-variant docs for the exact units and semantics.
 #[derive(Debug)]
 pub enum MeasurementMatch {
     /// A set of [Measurement]s did match
@@ -193,6 +195,39 @@ pub enum MeasurementMatch {
         /// by these skipped periods, or its timeline will run progressively
         /// early.
         missed: u32,
+        /// Wall-clock instant at which the USB `read()` that delivered these
+        /// bytes RETURNED to this crate.
+        ///
+        /// **This is NOT capture time.** It is an UPPER BOUND on the capture
+        /// time of every sample in this chunk: the device sampled them,
+        /// buffered them, and the host USB stack delivered them, all strictly
+        /// before this instant.
+        ///
+        /// It is stamped inside the measurement worker immediately after
+        /// `read()` returns and before any parsing, so it deliberately
+        /// EXCLUDES the mpsc queueing delay and the consumer's own scheduling
+        /// — those contribute tens of milliseconds of jitter that would
+        /// otherwise dominate any offset estimate derived from it.
+        ///
+        /// **A chunk may span two reads.** Leftover samples below the
+        /// decimation `chunk` size stay buffered for the next read, so a chunk
+        /// that begins in read N and completes in read N+1 carries read N+1's
+        /// — the LATER — stamp. That is deliberate and correct for a consumer
+        /// estimating a latency floor via a minimum, because it never
+        /// UNDER-states arrival; under-stating would let a consumer place a
+        /// sample earlier than it could possibly have been captured.
+        ///
+        /// Consumers estimating the capture-to-arrival latency should take the
+        /// MINIMUM of `read_at - synthesized_timestamp` over many samples as
+        /// the latency floor. A single value includes whatever device and USB
+        /// buffering that particular read happened to carry and is not
+        /// meaningful on its own.
+        ///
+        /// [`SystemTime`] rather than `std::time::Instant` because the
+        /// consumer needs an absolute wall clock it can compare against
+        /// timestamps from other instruments; it is therefore subject to
+        /// wall-clock adjustments (NTP steps, manual changes).
+        read_at: SystemTime,
     },
     /// No matching [Measurement]s in the last chunk
     NoMatch {
@@ -206,6 +241,39 @@ pub enum MeasurementMatch {
         /// by these skipped periods, or its timeline will run progressively
         /// early.
         missed: u32,
+        /// Wall-clock instant at which the USB `read()` that delivered these
+        /// bytes RETURNED to this crate.
+        ///
+        /// **This is NOT capture time.** It is an UPPER BOUND on the capture
+        /// time of every sample in this chunk: the device sampled them,
+        /// buffered them, and the host USB stack delivered them, all strictly
+        /// before this instant.
+        ///
+        /// It is stamped inside the measurement worker immediately after
+        /// `read()` returns and before any parsing, so it deliberately
+        /// EXCLUDES the mpsc queueing delay and the consumer's own scheduling
+        /// — those contribute tens of milliseconds of jitter that would
+        /// otherwise dominate any offset estimate derived from it.
+        ///
+        /// **A chunk may span two reads.** Leftover samples below the
+        /// decimation `chunk` size stay buffered for the next read, so a chunk
+        /// that begins in read N and completes in read N+1 carries read N+1's
+        /// — the LATER — stamp. That is deliberate and correct for a consumer
+        /// estimating a latency floor via a minimum, because it never
+        /// UNDER-states arrival; under-stating would let a consumer place a
+        /// sample earlier than it could possibly have been captured.
+        ///
+        /// Consumers estimating the capture-to-arrival latency should take the
+        /// MINIMUM of `read_at - synthesized_timestamp` over many samples as
+        /// the latency floor. A single value includes whatever device and USB
+        /// buffering that particular read happened to carry and is not
+        /// meaningful on its own.
+        ///
+        /// [`SystemTime`] rather than `std::time::Instant` because the
+        /// consumer needs an absolute wall clock it can compare against
+        /// timestamps from other instruments; it is therefore subject to
+        /// wall-clock adjustments (NTP steps, manual changes).
+        read_at: SystemTime,
     },
 }
 
@@ -234,7 +302,15 @@ pub trait MeasurementIterExt {
     /// propagated verbatim into the returned variant (saturating at
     /// [`u32::MAX`]), including on the empty-input path, so no pending count is
     /// ever silently dropped.
-    fn combine(self, missed: usize) -> MeasurementMatch;
+    ///
+    /// `read_at` is the wall-clock instant the USB `read()` that delivered
+    /// these bytes returned to this crate — an UPPER BOUND on the capture time
+    /// of the samples in this chunk, never capture time itself. It is
+    /// propagated verbatim into BOTH returned variants, so a consumer never has
+    /// to handle its absence. When a chunk spans two reads the caller passes
+    /// the LATER read's stamp; see [`MeasurementMatch::Match`] for the full
+    /// semantics a consumer must respect.
+    fn combine(self, missed: usize, read_at: SystemTime) -> MeasurementMatch;
 
     /// Combine items with matching logic port state into a single [MeasurementMatch::Match],
     /// if there are items. If there are none, [MeasurementMatch::NoMatch] is returned.
@@ -251,11 +327,24 @@ pub trait MeasurementIterExt {
     /// propagated verbatim into the returned variant (saturating at
     /// [`u32::MAX`]), including on the empty-input path, so no pending count is
     /// ever silently dropped.
-    fn combine_matching(self, missed: usize, matching_pins: LogicPortPins) -> MeasurementMatch;
+    ///
+    /// `read_at` is the wall-clock instant the USB `read()` that delivered
+    /// these bytes returned to this crate — an UPPER BOUND on the capture time
+    /// of the samples in this chunk, never capture time itself. It is
+    /// propagated verbatim into BOTH returned variants, so a consumer never has
+    /// to handle its absence. When a chunk spans two reads the caller passes
+    /// the LATER read's stamp; see [`MeasurementMatch::Match`] for the full
+    /// semantics a consumer must respect.
+    fn combine_matching(
+        self,
+        missed: usize,
+        read_at: SystemTime,
+        matching_pins: LogicPortPins,
+    ) -> MeasurementMatch;
 }
 
 impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
-    fn combine(self, missed: usize) -> MeasurementMatch {
+    fn combine(self, missed: usize, read_at: SystemTime) -> MeasurementMatch {
         let mut pin_high_count = [0usize; 8];
         let mut count = 0;
         let mut sum = 0f32;
@@ -276,6 +365,7 @@ impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
             // elapsed-but-sampleless time from the consumer's timeline.
             return MeasurementMatch::NoMatch {
                 missed: saturating_missed(missed),
+                read_at,
             };
         }
 
@@ -299,10 +389,16 @@ impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
                 pins: pins.into(),
             },
             missed: saturating_missed(missed),
+            read_at,
         }
     }
 
-    fn combine_matching(self, missed: usize, matching_pins: LogicPortPins) -> MeasurementMatch {
+    fn combine_matching(
+        self,
+        missed: usize,
+        read_at: SystemTime,
+        matching_pins: LogicPortPins,
+    ) -> MeasurementMatch {
         let iter = self.filter(|m| {
             m.pins
                 .inner()
@@ -310,7 +406,7 @@ impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
                 .enumerate()
                 .all(|(i, l)| l.matches(matching_pins.inner()[i]))
         });
-        iter.combine(missed)
+        iter.combine(missed, read_at)
     }
 }
 
