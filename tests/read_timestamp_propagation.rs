@@ -30,6 +30,16 @@
 //! value is the one handed to `combine_matching`. Everything downstream of
 //! those two lines is covered.
 //!
+//! Note that `src/lib.rs` emits per read ACCUMULATION, not per `read()`: after
+//! a read returns it keeps reading until it holds `READ_ACCUM_TARGET_BYTES`,
+//! `READ_ACCUM_WINDOW` elapses, or the buffer fills, re-stamping `read_at`
+//! after each successful read so the emission carries the LAST one. That only
+//! changes how bytes are grouped into a `feed_into` call and which stamp rides
+//! along — both already free parameters here, since this test drives
+//! `feed_into` with irregular slice sizes and synthetic stamps. The property
+//! under test is unchanged: an emission never under-states its own last
+//! sample's arrival.
+//!
 //! Synthetic, monotonically increasing stamps stand in for `SystemTime::now()`
 //! so the assertions are exact rather than timing-dependent — the test never
 //! sleeps and has no wall-clock flake surface.

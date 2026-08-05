@@ -17,6 +17,17 @@ serialport = "4.7.2"
 thiserror = "2.0.12"
 tracing = "0.1.41"
 
+# Windows-only: `SetCommTimeouts` / `COMMTIMEOUTS`, used to program the serial
+# driver for read coalescing on the measurement port (see `win_read_coalescing`
+# in src/lib.rs). This is the SAME version serialport 4.9 already depends on for
+# `cfg(windows)`, with a subset of its features, so nothing new enters the
+# dependency tree — only an edge to a crate that was already there.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52.0", features = [
+    "Win32_Devices_Communication",
+    "Win32_Foundation",
+] }
+
 [dev-dependencies]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 ctrlc = "3.4.7"
