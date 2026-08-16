@@ -16,3 +16,6 @@ Cargo.lock
 
 # Editor stuff
 .vscode
+
+# transport_probe capture output (hundreds of MB per run)
+/capture/
