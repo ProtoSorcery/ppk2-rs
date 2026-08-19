@@ -12,22 +12,37 @@
 //! `chunk = SPS_MAX/sps`-sample units in a while-loop so averaging no longer
 //! depends on read size.
 //!
-//! This test replicates that feed + fixed-chunk-drain loop for two read-chunk
-//! sizes (4 bytes vs 4096 bytes) at two `sps` values (sps=100_000 => chunk=1,
-//! non-decimating; sps=10_000 => chunk=10, decimating) and asserts the emitted
-//! `MeasurementMatch` sequences are bit-identical across read sizes for the
-//! same sps. That is the guard that read-buffer size never changes decimated
-//! output.
+//! This test drives the production timebase (`ppk2::stream::StreamAssembler`)
+//! for two read-chunk sizes (4 bytes vs 4096 bytes) at two `sps` values
+//! (sps=100_000 => chunk=1, non-decimating; sps=10_000 => chunk=10, decimating)
+//! and asserts the emitted `MeasurementMatch` sequences are bit-identical across
+//! read sizes for the same sps. That is the guard that read-buffer size never
+//! changes decimated output.
+//!
+//! ## What the timebase rewrite changed here
+//!
+//! Two things. First, this test used to REPLICATE the worker's feed-then-drain
+//! loop, because that loop was inline in a thread unreachable without hardware;
+//! the loop now lives in a struct that takes reads as plain arguments, so the
+//! property is checked against production code rather than a copy of it.
+//!
+//! Second, `read_at` used to be EXCLUDED from the comparison, on the grounds
+//! that it was stamped per USB read and so legitimately differed between read
+//! sizes — the same stream split into 4-byte reads produced a thousand times
+//! more distinct stamps than the same stream split into 4096-byte reads. Under
+//! the new contract `read_at` is the CAPTURE time of the chunk's first raw
+//! sample, which is a property of the samples and not of how the OS driver
+//! happened to hand them over. It is therefore now IN the comparison, making
+//! this a strictly stronger test: read size may not change the emitted
+//! timestamps either.
 //!
 //! Run:
 //!   cargo test --test drain_chunking_equivalence -- --nocapture
 
-use std::collections::VecDeque;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use ppk2::measurement::{
-    Measurement, MeasurementAccumulator, MeasurementIterExt, MeasurementMatch,
-};
+use ppk2::measurement::{Measurement, MeasurementMatch};
+use ppk2::stream::{ReadClocks, StreamAssembler, RAW_SAMPLE_PERIOD};
 use ppk2::types::{LogicPortPins, Metadata};
 /// Device hardware sample rate (samples/sec); the decimation chunk size is
 /// `SPS_MAX / sps`. Re-exported from the crate so this test cannot drift from
@@ -82,16 +97,13 @@ fn build_stream() -> Vec<u8> {
 
 /// A `MeasurementMatch` reduced to a bit-comparable form. `MeasurementMatch`
 /// has no `PartialEq`, so we compare exact float bits + the 8-bit pin bitmask,
-/// paired with the variant's skipped-raw-sample count.
+/// paired with the variant's skipped-raw-sample count and its capture time.
 /// `None` in the first slot represents `MeasurementMatch::NoMatch`.
 ///
-/// `read_at` is deliberately EXCLUDED from this comparison. It is stamped per
-/// USB `read()`, so it legitimately differs between read sizes: the same
-/// sample stream split into 4-byte reads produces a thousand times more
-/// distinct stamps than the same stream split into 4096-byte reads. Only the
-/// MEASUREMENT output is required to be read-size independent. `read_at`'s own
-/// behaviour is pinned down in `tests/read_timestamp_propagation.rs`.
-type EmittedMatch = (Option<(u32, u8)>, u32);
+/// `read_at` is INCLUDED — see the module docs for why that is now both possible
+/// and necessary. Its own behaviour is pinned down in
+/// `tests/capture_timestamp_contract.rs`.
+type EmittedMatch = (Option<(u32, u8)>, u32, SystemTime);
 
 fn pin_mask(m: &Measurement) -> u8 {
     let mut mask = 0u8;
@@ -108,46 +120,55 @@ fn reduce(m: MeasurementMatch) -> EmittedMatch {
         MeasurementMatch::Match {
             measurement,
             missed,
-            read_at: _,
+            read_at,
         } => (
             Some((measurement.micro_amps.to_bits(), pin_mask(&measurement))),
             missed,
+            read_at,
         ),
-        MeasurementMatch::NoMatch { missed, read_at: _ } => (None, missed),
+        MeasurementMatch::NoMatch { missed, read_at } => (None, missed, read_at),
+        // This fixture has a perfectly clean, perfectly paced stream: no samples
+        // are lost and no seam can go backwards. Either event appearing here is
+        // itself the bug.
+        other => panic!("unexpected event in a clean stream: {other:?}"),
     }
 }
 
-/// Replicate the production streaming loop's feed + fixed-chunk-drain logic
-/// (see `Ppk2::start_measurement_matching` in `src/lib.rs`): read the stream in
-/// `read_size`-byte slices, feed each to the accumulator, then drain in fixed
-/// `chunk = (SPS_MAX/sps).max(1)`-sample units, combining each chunk via
-/// `combine_matching`. Returns the sequence of emitted (reduced) matches.
+/// Drive the production timebase (`ppk2::stream::StreamAssembler`, which
+/// `Ppk2::start_measurement_matching` hands every read to): feed the stream in
+/// `read_size`-byte slices and collect the emitted (reduced) matches.
+///
+/// Every read is declared as having drained the port, and the synthetic clock is
+/// advanced by exactly the stream time each read carried — the timeline a
+/// perfect transport with a perfectly constant delay would produce. That is what
+/// makes the timestamps comparable across read sizes: any difference is the
+/// assembler's, not the fixture's.
 fn run(stream: &[u8], metadata: &Metadata, read_size: usize, sps: usize) -> Vec<EmittedMatch> {
-    let pins = LogicPortPins::default();
-    let chunk = (SPS_MAX / sps).max(1);
-
-    let mut acc = MeasurementAccumulator::new(metadata.clone());
-    let mut measurement_buf: VecDeque<Measurement> = VecDeque::with_capacity(SPS_MAX);
+    let mut assembler = StreamAssembler::new(metadata.clone(), sps, LogicPortPins::default());
+    let mut out = Vec::new();
     let mut emitted: Vec<EmittedMatch> = Vec::new();
-    let mut missed = 0;
+    let mono = Instant::now();
+    let mut elapsed = Duration::ZERO;
 
-    for (read_index, read) in stream.chunks(read_size).enumerate() {
-        // Production stamps `SystemTime::now()` here, immediately after
-        // `read()` returns. A synthetic monotonically increasing stamp keeps
-        // this test deterministic; the value is not compared across read sizes
-        // (see `EmittedMatch`).
-        let read_at = SystemTime::UNIX_EPOCH + Duration::from_micros(read_index as u64);
-        missed += acc.feed_into(read, &mut measurement_buf);
-        while measurement_buf.len() >= chunk {
-            let m = measurement_buf
-                .drain(..chunk)
-                .combine_matching(missed, read_at, pins);
-            emitted.push(reduce(m));
-            missed = 0;
-        }
+    for read in stream.chunks(read_size) {
+        // The read completes after its LAST sample was captured, so the clock
+        // sits at that sample's capture time.
+        elapsed += RAW_SAMPLE_PERIOD * (read.len() / 4) as u32;
+        out.clear();
+        assembler.on_read(
+            ReadClocks {
+                sys: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000) + elapsed,
+                mono: mono + elapsed,
+            },
+            read,
+            &[],
+            true,
+            &mut out,
+        );
+        emitted.extend(out.drain(..).map(reduce));
     }
-    // Leftover samples (< chunk) intentionally remain undrained, mirroring the
-    // production loop which holds them for the next read.
+    // Leftover samples (< chunk) intentionally remain held, mirroring production,
+    // which completes them from the next read.
     emitted
 }
 

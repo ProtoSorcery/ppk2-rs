@@ -110,20 +110,37 @@ fn main() -> Result<()> {
                 missed,
                 read_at,
             }) => {
-                // `read_at` is when the USB read that carried this chunk
-                // returned — an upper bound on capture time, not capture time.
-                let queued_for = read_at.elapsed().unwrap_or_default().as_micros();
+                // `read_at` is the CAPTURE time of the first raw sample in this
+                // chunk, so this is end-to-end latency: capture to here.
+                let age = read_at.elapsed().unwrap_or_default().as_micros();
                 debug!(
-                    "Last chunk average: {:.4} μA ({missed} raw samples skipped, \
-                     {queued_for} μs since the USB read returned)",
+                    "Last chunk average: {:.4} μA ({missed} raw samples skipped by the \
+                     device, {age} μs since capture)",
                     measurement.micro_amps
                 );
             }
             Ok(NoMatch { missed, read_at }) => {
-                let queued_for = read_at.elapsed().unwrap_or_default().as_micros();
+                let age = read_at.elapsed().unwrap_or_default().as_micros();
                 debug!(
                     "No match in the last chunk of measurements ({missed} raw samples \
-                     skipped, {queued_for} μs since the USB read returned)"
+                     skipped by the device, {age} μs since capture)"
+                );
+            }
+            // A hole in the timeline: samples were lost and what follows is NOT
+            // contiguous with what came before. Loud on purpose.
+            Ok(Dropped { at, samples }) => {
+                error!("{samples} raw samples lost at {at:?} — the timeline has a hole here");
+            }
+            // NOT a hole: the transport delay wobbled and a redundant overlap was
+            // trimmed. Deliberately not reported as loss.
+            Ok(SeamOverlap {
+                at,
+                samples_trimmed,
+                overlap,
+            }) => {
+                debug!(
+                    "Seam at {at:?}: trimmed {samples_trimmed} raw samples covering \
+                     {overlap:?} of already-delivered time (timing jitter, no data missing)"
                 );
             }
             Err(RecvTimeoutError::Disconnected) => break Ok(()),

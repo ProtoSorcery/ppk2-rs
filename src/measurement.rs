@@ -1,7 +1,7 @@
 //! Measurement parsing and preprocessing
 
 use std::collections::VecDeque;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::types::{LogicPortPins, Metadata};
 
@@ -173,12 +173,45 @@ fn get_adc_result(
     adc
 }
 
-/// Indicates whether a set of [Measurement]s matched.
+/// One item in the measurement stream: either a decimated measurement, or an
+/// out-of-band event describing something that happened to the timeline.
 ///
-/// Both variants carry a `missed` count so that a consumer can reconstruct a
-/// correct timeline even when the device dropped samples, and a `read_at`
-/// wall-clock stamp so that a consumer can bound how late that timeline is.
-/// See the per-variant docs for the exact units and semantics.
+/// # The timestamp contract
+///
+/// `read_at` on the two measurement variants is the **wall-clock capture time of
+/// the first raw device sample** averaged into that measurement. Consecutive
+/// measurements emitted from one block are spaced by exactly
+/// `chunk / SPS_MAX` seconds and have no gap between them. Nothing is promised
+/// *across* blocks: a consumer must use each `read_at` as given and must never
+/// extrapolate from an earlier one.
+///
+/// The accuracy of `read_at` is a documented constant of this contract rather
+/// than a per-item field: it is the USB transport delay, measured at up to ~8 ms
+/// and roughly constant for a given host. A per-item error bound was considered
+/// and rejected — nothing downstream can act differently on a 1 ms versus a 5 ms
+/// margin, so carrying one would be complexity without benefit.
+///
+/// [`SystemTime`] rather than [`std::time::Instant`] because a consumer needs an
+/// absolute wall clock it can compare against timestamps from other instruments.
+/// It is therefore subject to wall-clock adjustments; the crate detects large
+/// steps and reports them (see [`MeasurementMatch::Dropped`]).
+///
+/// # What changed, and why the old promise had to go
+///
+/// `read_at` previously meant "the instant the USB read that delivered these
+/// bytes returned", documented as an UPPER BOUND on capture time, with a chunk
+/// spanning two reads deliberately carrying the LATER stamp. That was sound as
+/// far as it went, but it is unusable as a timebase: during a drain, arrival
+/// bears no relationship to capture. Four consecutive 1020-byte reads were
+/// measured arriving 253 µs apart while each carried 2.55 ms of samples.
+/// Stamping from arrival — forward from the first sample or back-dated from the
+/// last — yields overlapping, non-monotonic timestamps for the majority of
+/// samples under load.
+///
+/// The crate now classifies reads by whether they drained the port, anchors only
+/// on those, and pins everything else backward onto the next anchor. `read_at`
+/// is the result of that placement, so it is EARLIER than the read that carried
+/// it and is no longer an upper bound on anything.
 #[derive(Debug)]
 pub enum MeasurementMatch {
     /// A set of [Measurement]s did match
@@ -190,43 +223,14 @@ pub enum MeasurementMatch {
         ///
         /// **Units are raw device samples at `SPS_MAX`, not decimated output
         /// periods.** A consumer decimating by `chunk = SPS_MAX / sps` must
-        /// divide by `chunk` to convert to output periods. A consumer that
-        /// synthesizes timestamps from a sample index MUST advance that index
-        /// by these skipped periods, or its timeline will run progressively
-        /// early.
+        /// divide by `chunk` to convert to output periods.
+        ///
+        /// This counts only DEVICE-side loss. Samples this crate discarded
+        /// because they could no longer be placed in time are reported
+        /// separately as [`MeasurementMatch::Dropped`].
         missed: u32,
-        /// Wall-clock instant at which the USB `read()` that delivered these
-        /// bytes RETURNED to this crate.
-        ///
-        /// **This is NOT capture time.** It is an UPPER BOUND on the capture
-        /// time of every sample in this chunk: the device sampled them,
-        /// buffered them, and the host USB stack delivered them, all strictly
-        /// before this instant.
-        ///
-        /// It is stamped inside the measurement worker immediately after
-        /// `read()` returns and before any parsing, so it deliberately
-        /// EXCLUDES the mpsc queueing delay and the consumer's own scheduling
-        /// — those contribute tens of milliseconds of jitter that would
-        /// otherwise dominate any offset estimate derived from it.
-        ///
-        /// **A chunk may span two reads.** Leftover samples below the
-        /// decimation `chunk` size stay buffered for the next read, so a chunk
-        /// that begins in read N and completes in read N+1 carries read N+1's
-        /// — the LATER — stamp. That is deliberate and correct for a consumer
-        /// estimating a latency floor via a minimum, because it never
-        /// UNDER-states arrival; under-stating would let a consumer place a
-        /// sample earlier than it could possibly have been captured.
-        ///
-        /// Consumers estimating the capture-to-arrival latency should take the
-        /// MINIMUM of `read_at - synthesized_timestamp` over many samples as
-        /// the latency floor. A single value includes whatever device and USB
-        /// buffering that particular read happened to carry and is not
-        /// meaningful on its own.
-        ///
-        /// [`SystemTime`] rather than `std::time::Instant` because the
-        /// consumer needs an absolute wall clock it can compare against
-        /// timestamps from other instruments; it is therefore subject to
-        /// wall-clock adjustments (NTP steps, manual changes).
+        /// Wall-clock capture time of the FIRST raw device sample averaged into
+        /// this measurement. See the type-level docs for the full contract.
         read_at: SystemTime,
     },
     /// No matching [Measurement]s in the last chunk
@@ -236,44 +240,64 @@ pub enum MeasurementMatch {
         ///
         /// **Units are raw device samples at `SPS_MAX`, not decimated output
         /// periods.** A consumer decimating by `chunk = SPS_MAX / sps` must
-        /// divide by `chunk` to convert to output periods. A consumer that
-        /// synthesizes timestamps from a sample index MUST advance that index
-        /// by these skipped periods, or its timeline will run progressively
-        /// early.
+        /// divide by `chunk` to convert to output periods.
+        ///
+        /// This counts only DEVICE-side loss. Samples this crate discarded
+        /// because they could no longer be placed in time are reported
+        /// separately as [`MeasurementMatch::Dropped`].
         missed: u32,
-        /// Wall-clock instant at which the USB `read()` that delivered these
-        /// bytes RETURNED to this crate.
-        ///
-        /// **This is NOT capture time.** It is an UPPER BOUND on the capture
-        /// time of every sample in this chunk: the device sampled them,
-        /// buffered them, and the host USB stack delivered them, all strictly
-        /// before this instant.
-        ///
-        /// It is stamped inside the measurement worker immediately after
-        /// `read()` returns and before any parsing, so it deliberately
-        /// EXCLUDES the mpsc queueing delay and the consumer's own scheduling
-        /// — those contribute tens of milliseconds of jitter that would
-        /// otherwise dominate any offset estimate derived from it.
-        ///
-        /// **A chunk may span two reads.** Leftover samples below the
-        /// decimation `chunk` size stay buffered for the next read, so a chunk
-        /// that begins in read N and completes in read N+1 carries read N+1's
-        /// — the LATER — stamp. That is deliberate and correct for a consumer
-        /// estimating a latency floor via a minimum, because it never
-        /// UNDER-states arrival; under-stating would let a consumer place a
-        /// sample earlier than it could possibly have been captured.
-        ///
-        /// Consumers estimating the capture-to-arrival latency should take the
-        /// MINIMUM of `read_at - synthesized_timestamp` over many samples as
-        /// the latency floor. A single value includes whatever device and USB
-        /// buffering that particular read happened to carry and is not
-        /// meaningful on its own.
-        ///
-        /// [`SystemTime`] rather than `std::time::Instant` because the
-        /// consumer needs an absolute wall clock it can compare against
-        /// timestamps from other instruments; it is therefore subject to
-        /// wall-clock adjustments (NTP steps, manual changes).
+        /// Wall-clock capture time of the FIRST raw device sample this chunk
+        /// covered. See the type-level docs for the full contract.
         read_at: SystemTime,
+    },
+    /// **There is a hole in the timeline here.** Samples were lost and the
+    /// stream that resumes after this event is not contiguous with what came
+    /// before it.
+    ///
+    /// Emitted when this crate could no longer place held samples in time and
+    /// discarded them — a host suspend (which loses everything for the suspended
+    /// interval and is a routine event, firing roughly every 4 minutes on a
+    /// sleeping laptop), a device or driver stall longer than the guard, ring
+    /// overflow, or a backwards wall-clock step that breaks the timebase.
+    ///
+    /// This is the signal a consumer should surface loudly. It is deliberately
+    /// out of band rather than a `contiguous_with_previous` flag on each
+    /// measurement: this crate cannot know whether two blocks *should* have been
+    /// contiguous, but it knows exactly when it threw something away.
+    Dropped {
+        /// Wall-clock position of the hole: the point at which delivery resumes.
+        at: SystemTime,
+        /// Raw samples this crate discarded, at `SPS_MAX`. Zero when the
+        /// timeline broke without data loss — a backwards wall-clock step, where
+        /// every sample survived but nothing before the step can be compared
+        /// with anything after it.
+        ///
+        /// This does NOT include device-side loss, which is reported per
+        /// measurement as `missed`.
+        samples: u64,
+    },
+    /// **There is NO hole here.** The transport delay wobbled, so a block would
+    /// have started fractionally before the previous one ended, and samples were
+    /// trimmed off its front to keep the stream monotonic.
+    ///
+    /// Kept distinct from [`MeasurementMatch::Dropped`] on purpose: these two
+    /// diagnose different faults. `Dropped` means data is missing from the
+    /// timeline; `SeamOverlap` means the timing jittered and the data was
+    /// redundant. Reporting jitter as loss would send someone hunting a USB
+    /// fault that does not exist.
+    ///
+    /// Trimming is chosen over shifting the block forward so that every sample
+    /// that IS delivered keeps its own true computed timestamp, making the loss
+    /// an honest absence rather than a known-wrong time on every sample.
+    SeamOverlap {
+        /// Wall-clock position of the seam: where the incoming block would have
+        /// started had it not been trimmed.
+        at: SystemTime,
+        /// Raw samples trimmed off the front of the block. Equal to the whole
+        /// block when it lay entirely inside already-delivered time.
+        samples_trimmed: u64,
+        /// How far back the incoming block reached into already-delivered time.
+        overlap: Duration,
     },
 }
 
@@ -303,13 +327,11 @@ pub trait MeasurementIterExt {
     /// [`u32::MAX`]), including on the empty-input path, so no pending count is
     /// ever silently dropped.
     ///
-    /// `read_at` is the wall-clock instant the USB `read()` that delivered
-    /// these bytes returned to this crate — an UPPER BOUND on the capture time
-    /// of the samples in this chunk, never capture time itself. It is
-    /// propagated verbatim into BOTH returned variants, so a consumer never has
-    /// to handle its absence. When a chunk spans two reads the caller passes
-    /// the LATER read's stamp; see [`MeasurementMatch::Match`] for the full
-    /// semantics a consumer must respect.
+    /// `read_at` is the wall-clock CAPTURE time of the first raw sample in this
+    /// chunk, as computed by [`crate::stream::StreamAssembler`] — not the
+    /// instant any read returned. It is propagated verbatim into BOTH returned
+    /// variants, so a consumer never has to handle its absence. See
+    /// [`MeasurementMatch`] for the full contract.
     fn combine(self, missed: usize, read_at: SystemTime) -> MeasurementMatch;
 
     /// Combine items with matching logic port state into a single [MeasurementMatch::Match],
@@ -328,13 +350,11 @@ pub trait MeasurementIterExt {
     /// [`u32::MAX`]), including on the empty-input path, so no pending count is
     /// ever silently dropped.
     ///
-    /// `read_at` is the wall-clock instant the USB `read()` that delivered
-    /// these bytes returned to this crate — an UPPER BOUND on the capture time
-    /// of the samples in this chunk, never capture time itself. It is
-    /// propagated verbatim into BOTH returned variants, so a consumer never has
-    /// to handle its absence. When a chunk spans two reads the caller passes
-    /// the LATER read's stamp; see [`MeasurementMatch::Match`] for the full
-    /// semantics a consumer must respect.
+    /// `read_at` is the wall-clock CAPTURE time of the first raw sample in this
+    /// chunk, as computed by [`crate::stream::StreamAssembler`] — not the
+    /// instant any read returned. It is propagated verbatim into BOTH returned
+    /// variants, so a consumer never has to handle its absence. See
+    /// [`MeasurementMatch`] for the full contract.
     fn combine_matching(
         self,
         missed: usize,

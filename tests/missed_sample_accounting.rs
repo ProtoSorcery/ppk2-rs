@@ -24,15 +24,29 @@
 //! periods; this test therefore checks the identity at both a non-decimating
 //! (`chunk == 1`) and a decimating (`chunk == 10`) rate.
 //!
+//! ## What the timebase rewrite changed here
+//!
+//! The invariant is unchanged and deliberately so — it is the one thing the new
+//! timebase had to leave alone. What changed is that this test no longer
+//! REPLICATES the worker's feed-then-drain loop: that loop moved into
+//! `ppk2::stream::StreamAssembler`, which takes reads as plain arguments, so the
+//! accounting is now checked against production code instead of against a copy
+//! of it. Reads alternate between draining and backlogged, which exercises the
+//! path where `missed` accumulates across many held reads before anything is
+//! emitted — the path where a premature reset would be hardest to spot.
+//!
+//! `missed` counts DEVICE-side loss only. Samples this crate discards because
+//! they can no longer be placed in time are a different thing entirely and are
+//! reported as `MeasurementMatch::Dropped`; neither of the new event variants
+//! carries a `missed` count, and neither may occur in this fixture at all.
+//!
 //! Run:
 //!   cargo test --test missed_sample_accounting -- --nocapture
 
-use std::collections::VecDeque;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use ppk2::measurement::{
-    Measurement, MeasurementAccumulator, MeasurementIterExt, MeasurementMatch,
-};
+use ppk2::measurement::{Measurement, MeasurementIterExt, MeasurementMatch};
+use ppk2::stream::{ReadClocks, StreamAssembler, RAW_SAMPLE_PERIOD};
 use ppk2::types::{LogicPortPins, Metadata};
 use ppk2::SPS_MAX;
 
@@ -101,39 +115,63 @@ fn build_stream_with_gaps() -> (Vec<u8>, usize) {
     (stream, removed)
 }
 
-/// Replicate the production streaming loop (see
-/// `Ppk2::start_measurement_matching` in `src/lib.rs`) and return
-/// `(missed_summed_over_emitted, missed_still_pending, emitted_count)`.
-fn run(stream: &[u8], metadata: &Metadata, read_size: usize, sps: usize) -> (u64, usize, usize) {
-    let pins = LogicPortPins::default();
-    let chunk = (SPS_MAX / sps).max(1);
-
-    let mut acc = MeasurementAccumulator::new(metadata.clone());
-    let mut measurement_buf: VecDeque<Measurement> = VecDeque::with_capacity(SPS_MAX);
-    let mut missed = 0usize;
+/// Drive the real production timebase (`ppk2::stream::StreamAssembler`, which
+/// `Ppk2::start_measurement_matching` hands every read to) and return
+/// `(missed_summed_over_emitted, emitted_count)`.
+///
+/// This test used to REPLICATE the worker's feed-then-drain loop, because the
+/// loop was inline in a thread that cannot run without hardware. The timebase now
+/// lives in a struct that takes reads as plain arguments, so the accounting can
+/// be checked against production code instead of against a copy of it.
+///
+/// Reads alternate between "drained the port" and "swept up a backlog", so the
+/// invariant is exercised across held runs — the path where `missed` accumulates
+/// over many reads before anything is emitted, and therefore the path where a
+/// premature reset would be invisible at a glance.
+///
+/// Nothing is still pending at the end here because the final read is declared
+/// draining, but `missed` for a partial trailing chunk legitimately stays inside
+/// the assembler; the assertion accounts for that by construction (the fixture's
+/// sample count is a multiple of every `chunk` used).
+fn run(stream: &[u8], metadata: &Metadata, read_size: usize, sps: usize) -> (u64, usize) {
+    let mut assembler = StreamAssembler::new(metadata.clone(), sps, LogicPortPins::default());
+    let mut out = Vec::new();
     let mut missed_total = 0u64;
     let mut emitted = 0usize;
+    let mono = Instant::now();
+    let mut elapsed = Duration::ZERO;
 
+    let n_reads = stream.len().div_ceil(read_size);
     for (read_index, read) in stream.chunks(read_size).enumerate() {
-        // Production stamps `SystemTime::now()` here, immediately after
-        // `read()` returns. A synthetic stamp keeps this test deterministic; it
-        // is irrelevant to the `missed` accounting, which is exactly what this
-        // test pins down — threading `read_at` through must not perturb it.
-        let read_at = SystemTime::UNIX_EPOCH + Duration::from_micros(read_index as u64);
-        missed += acc.feed_into(read, &mut measurement_buf);
-        while measurement_buf.len() >= chunk {
-            let m = measurement_buf
-                .drain(..chunk)
-                .combine_matching(missed, read_at, pins);
+        // Advance the synthetic clock by exactly the stream time this read
+        // carried, so no seam trimming or stall can occur and the only thing
+        // under test is the accounting.
+        elapsed += RAW_SAMPLE_PERIOD * (read.len() / 4) as u32;
+        out.clear();
+        assembler.on_read(
+            ReadClocks {
+                sys: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000) + elapsed,
+                mono: mono + elapsed,
+            },
+            read,
+            &[],
+            // The last read must drain, or the tail stays held and unreported.
+            read_index % 3 == 0 || read_index + 1 == n_reads,
+            &mut out,
+        );
+        for m in out.drain(..) {
             missed_total += match m {
-                MeasurementMatch::Match { missed, .. } => u64::from(missed),
-                MeasurementMatch::NoMatch { missed, .. } => u64::from(missed),
+                MeasurementMatch::Match { missed, .. }
+                | MeasurementMatch::NoMatch { missed, .. } => u64::from(missed),
+                // Neither event carries a device-side skipped-sample count:
+                // `Dropped` is host-side loss and `SeamOverlap` is redundant
+                // data. Neither may occur in this fixture at all.
+                other => panic!("unexpected event in a clean stream: {other:?}"),
             };
             emitted += 1;
-            missed = 0;
         }
     }
-    (missed_total, missed, emitted)
+    (missed_total, emitted)
 }
 
 #[test]
@@ -150,15 +188,14 @@ fn summed_missed_equals_skipped_sample_count() {
     // is independent of both decimation and read chunking.
     for sps in [SPS_MAX, 10_000usize] {
         for read_size in [4usize, 4096usize] {
-            let (missed_total, pending, emitted) = run(&stream, &metadata, read_size, sps);
+            let (missed_total, emitted) = run(&stream, &metadata, read_size, sps);
 
             assert!(emitted > 0, "sps={sps} read={read_size}: nothing emitted");
             assert_eq!(
-                missed_total + pending as u64,
-                removed as u64,
-                "sps={sps} read={read_size}: summed `missed` ({missed_total}) + pending \
-                 ({pending}) != actually skipped samples ({removed}) — the consumer's \
-                 synthesized timeline would drift"
+                missed_total, removed as u64,
+                "sps={sps} read={read_size}: summed `missed` ({missed_total}) != \
+                 actually skipped samples ({removed}) — the consumer's timeline \
+                 would drift"
             );
         }
     }
@@ -173,7 +210,9 @@ fn missed_survives_the_empty_input_path() {
     let empty: Vec<Measurement> = Vec::new();
     match empty.into_iter().combine(42, SystemTime::UNIX_EPOCH) {
         MeasurementMatch::NoMatch { missed, .. } => assert_eq!(missed, 42),
-        MeasurementMatch::Match { .. } => panic!("expected NoMatch for an empty chunk"),
+        // `combine` builds measurements only; the out-of-band `Dropped` /
+        // `SeamOverlap` events come from the assembler and can never appear here.
+        other => panic!("expected NoMatch for an empty chunk, got {other:?}"),
     }
 }
 
@@ -198,6 +237,6 @@ fn missed_survives_the_pin_filtered_path() {
         .combine_matching(7, SystemTime::UNIX_EPOCH, require_all_high)
     {
         MeasurementMatch::NoMatch { missed, .. } => assert_eq!(missed, 7),
-        MeasurementMatch::Match { .. } => panic!("expected NoMatch when no pins match"),
+        other => panic!("expected NoMatch when no pins match, got {other:?}"),
     }
 }

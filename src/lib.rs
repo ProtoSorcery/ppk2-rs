@@ -1,19 +1,19 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
-use measurement::{MeasurementAccumulator, MeasurementIterExt, MeasurementMatch};
+use measurement::MeasurementMatch;
 use serialport::{ClearBuffer::Input, FlowControl, SerialPort};
 use std::io::Read;
 use std::str::Utf8Error;
 use std::sync::mpsc::{self, Receiver, SendError, TryRecvError};
 use std::{
     borrow::Cow,
-    collections::VecDeque,
     io,
     sync::{Arc, Condvar, Mutex},
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
+use stream::{probe_indicates_drained, ReadClocks, SilenceGuard, StreamAssembler};
 use thiserror::Error;
 use types::{DevicePower, LogicPortPins, MeasurementMode, Metadata, SourceVoltage};
 
@@ -21,6 +21,7 @@ use crate::cmd::Command;
 
 pub mod cmd;
 pub mod measurement;
+pub mod stream;
 pub mod types;
 
 /// The device's raw hardware sample rate, in samples/sec.
@@ -54,93 +55,39 @@ pub const SPS_MAX: usize = 100_000;
 /// verification; 4 KB keeps latency bounded while still collapsing syscalls.
 const USB_READ_BUF_BYTES: usize = 4 * 1024;
 
-/// Byte target for one read accumulation in the measurement worker.
+/// Bytes requested per read while Windows native read coalescing is active.
 ///
-/// # Why accumulate at all
+/// At the PPK2's ~400 KB/s this makes the BYTE count the binding constraint, so
+/// the cadence is ~5 ms of stream per read regardless of the system timer
+/// granularity that governs the coalescing window (a 5 ms `COMMTIMEOUTS`
+/// constant can round up to a ~15 ms tick, which against the full 4 KB buffer
+/// would let a read cover ~10 ms).
 ///
-/// How many bytes a single `read()` returns is a property of the OS serial
-/// driver, not of this crate, and it differs wildly across platforms:
-///
-/// - On macOS/Linux the tty layer hands back a large chunk per read, typically
-///   a whole USB transfer, so one read already carries hundreds of samples.
-/// - On **Windows** `serialport` configures `COMMTIMEOUTS` with
-///   `ReadIntervalTimeout = MAXDWORD` and `ReadTotalTimeoutMultiplier =
-///   MAXDWORD` (see `serialport::windows::COMPort::set_timeout`). Per the
-///   `COMMTIMEOUTS` remarks that combination means `ReadFile` returns
-///   IMMEDIATELY with whatever bytes are already in the driver buffer, however
-///   few — it only waits at all when the buffer is completely empty. At
-///   ~100,000 samples/sec (~400 KB/s) that yields tens of thousands of reads
-///   per second, each returning a handful of bytes.
-///
-/// Each such read is a syscall, a thread wakeup, its own `read_at` stamp, and
-/// its own trickle of `MeasurementMatch`es into the mpsc channel. The result on
-/// Windows is heavily fragmented delivery and ragged arrival timing, which
-/// destabilizes any consumer estimating an absolute offset from `read_at`.
-///
-/// So after a read returns we keep reading into the remaining buffer space
-/// until we hold this many bytes (or [`READ_ACCUM_WINDOW`] elapses, or the
-/// buffer fills), then parse and emit the whole accumulation at once.
-///
-/// 2 KB is 512 raw samples, ≈5 ms of stream at the full rate — deliberately
-/// matched to [`READ_ACCUM_WINDOW`] so neither bound dominates the other at
-/// full speed. It is well under [`USB_READ_BUF_BYTES`], so the buffer-full
-/// bound is a safety net rather than the normal exit.
-///
-/// This is intentionally NOT `cfg(windows)`-gated: it is stated in terms of
-/// bytes in hand, not platform. Where reads are already large (macOS) the
-/// first read alone meets this target and the accumulation block is skipped
-/// entirely, so those platforms are unchanged by construction.
-const READ_ACCUM_TARGET_BYTES: usize = 2 * 1024;
+/// Measured: 96.25% of reads return exactly this, at ~203 reads/s. Requesting
+/// 4096 instead halves the read rate and doubles the largest inter-read gap
+/// (5.8 → 10.4 ms) for no benefit. This value is well tuned; leave it.
+#[cfg(windows)]
+const WIN_READ_LEN_BYTES: usize = 2 * 1024;
 
-/// Maximum wall time spent accumulating bytes after the first read returns,
-/// measured from the moment that first read returned.
+/// Read timeout used for the follow-up drain probe on unix.
 ///
-/// This bounds the latency the accumulation can add when the stream is slower
-/// than full rate (or has stopped): we never hold parsed-able bytes longer than
-/// this waiting for [`READ_ACCUM_TARGET_BYTES`]. 5 ms sits comfortably inside
-/// the 10 ms coalescing window the consumer already applies.
-const READ_ACCUM_WINDOW: Duration = Duration::from_millis(5);
-
-/// Read timeout used for the CONTINUATION reads inside an accumulation.
+/// # This MUST be zero
 ///
-/// The port's normal timeout is hundreds of milliseconds, which is right for
-/// the first read (nothing is held, so blocking costs nothing) but wrong for a
-/// continuation read: a stream that stalls mid-accumulation would hold the
-/// bytes we already have hostage for that whole timeout. So the timeout is
-/// temporarily shortened for the continuation reads and restored afterwards.
+/// The probe asks "was anything still buffered at the instant the read
+/// returned". Any non-zero timeout turns it into "did anything arrive within the
+/// next N", which is a different — and at this data rate, useless — question:
+/// the PPK2 streams ~400 bytes per millisecond, so a 1 ms probe would find bytes
+/// essentially every time and report that no read ever drains the port. That
+/// would be a false negative manufactured by the instrument, and it would push
+/// every sample onto the backward-pinning path.
 ///
-/// # Why this equals [`READ_ACCUM_WINDOW`] rather than being much smaller
-///
-/// `SerialPort::set_timeout` sets the READ and WRITE timeouts together — the
-/// Windows backend writes `ReadTotalTimeoutConstant` AND
-/// `WriteTotalTimeoutConstant` from the same value. And a `try_clone`d port
-/// only *caches* the timeout per object: the handles are `DuplicateHandle`
-/// duplicates of one file object, so `SetCommTimeouts` changes the device for
-/// ALL of them (`serialport`'s own `try_clone` docs warn that changing settings
-/// through one clone of a port causes "nasty behavior" in the others).
-///
-/// [`Ppk2Commander`] holds such a clone and WRITES through it while this worker
-/// is streaming. Since a Windows read blocks whenever the driver buffer is
-/// empty, the shortened timeout is in force for essentially the whole duration
-/// of a measurement — so whatever value is chosen here IS the write timeout the
-/// commander gets. That path carries `set_device_power(Disabled)`, so making it
-/// fail spuriously could leave a DUT energized: exactly the hazard
-/// [`Ppk2::take_last_worker_error`]'s commit set out to remove.
-///
-/// 5 ms is therefore a deliberate floor. It is generous for the 2–3 byte writes
-/// the commander issues, while still bounding how long an accumulation can hold
-/// samples when the stream stalls. The deadline is checked BEFORE each read, so
-/// a read starting just under the deadline can overshoot by one timeout: worst
-/// case ≈ 2 × [`READ_ACCUM_WINDOW`] ≈ 10 ms, and only when the device has gone
-/// quiet mid-accumulation — a stream at rate hits
-/// [`READ_ACCUM_TARGET_BYTES`] long before any read blocks that long.
-///
-/// It must also never be sub-millisecond: the Windows backend converts the
-/// timeout to whole milliseconds, and the "return as soon as any bytes are
-/// available" `COMMTIMEOUTS` idiom is only documented for a constant strictly
-/// greater than zero. A sub-millisecond `Duration` would truncate to 0 and
-/// leave the total-timeout computation (`MAXDWORD * bytes + 0`) unbounded.
-const READ_ACCUM_POLL_TIMEOUT: Duration = READ_ACCUM_WINDOW;
+/// `serialport`'s unix backend `poll`s with the port timeout before reading, so
+/// zero makes the poll return immediately with only whether data is ready right
+/// now. It is per-object on unix, so shortening it here cannot disturb a
+/// concurrent [`Ppk2Commander`] write the way the Windows device-wide timeouts
+/// would.
+#[cfg(not(windows))]
+const PROBE_TIMEOUT: Duration = Duration::ZERO;
 
 /// Windows only: how long `ReadFile` may block while the serial driver
 /// coalesces bytes into a single read, in milliseconds.
@@ -188,16 +135,22 @@ const WIN_READ_COALESCE_MS: u32 = 5;
 /// reference the SAME kernel file object. Timeouts live on that object (Win32
 /// has no per-handle device state; `SetCommTimeouts` is a wrapper over
 /// `IOCTL_SERIAL_SET_TIMEOUTS`, which the serial driver stores per device), so
-/// programming them through any one handle governs them all. Two consequences,
-/// both load-bearing:
+/// programming them through any one handle governs them all. Three consequences,
+/// all load-bearing:
 ///
-/// 1. It is enough to apply this once, on the main thread, through the handle
-///    this `Ppk2` opened — the worker's cloned reader inherits it. No raw
-///    handle has to cross the thread boundary.
+/// 1. It is enough to apply this once, before the worker starts, through ANY
+///    handle to the device — including the worker's own clone, which is the one
+///    used here precisely so the raw handle the worker later needs for the drain
+///    probe is owned by the worker's port and cannot outlive it.
 /// 2. Any later `set_timeout` call on ANY clone **clobbers** it, restoring
-///    serialport's return-immediately idiom. That is why the userspace read
-///    accumulation is disabled while this is active (see the read loop) and why
-///    a single `set_timeout` is all that is needed to undo it on stop.
+///    serialport's return-immediately idiom. That is why the drain probe
+///    programs [`win_read_coalescing::apply_immediate`] directly rather than
+///    calling `set_timeout(Duration::ZERO)`, and why a single `set_timeout` is
+///    all that is needed to undo coalescing on stop.
+/// 3. Every form written here keeps the WRITE timeout at the port's configured
+///    value, so a concurrent `Ppk2Commander` write — which carries
+///    `set_device_power(Disabled)` and must not fail spuriously — is never
+///    affected by anything the read path does.
 ///
 /// # No command response is ever read while this is active
 ///
@@ -221,30 +174,66 @@ mod win_read_coalescing {
     /// `coalesce_ms` bounds how long a read may block; `write_timeout_ms` is
     /// passed through unchanged so concurrent writes keep their normal budget.
     pub(super) fn apply(handle: isize, coalesce_ms: u32, write_timeout_ms: u32) -> Result<()> {
-        let timeouts = COMMTIMEOUTS {
-            // No inter-byte timeout: do not cut a read short just because the
-            // stream paused briefly mid-transfer.
-            ReadIntervalTimeout: 0,
-            // Total read timeout is a flat constant, independent of how many
-            // bytes were requested, so the latency bound does not scale with
-            // the buffer size.
-            ReadTotalTimeoutMultiplier: 0,
-            ReadTotalTimeoutConstant: coalesce_ms,
-            // Writes keep the port's configured timeout. See the module docs.
-            WriteTotalTimeoutMultiplier: 0,
-            WriteTotalTimeoutConstant: write_timeout_ms,
-        };
+        set(
+            handle,
+            &COMMTIMEOUTS {
+                // No inter-byte timeout: do not cut a read short just because
+                // the stream paused briefly mid-transfer.
+                ReadIntervalTimeout: 0,
+                // Total read timeout is a flat constant, independent of how many
+                // bytes were requested, so the latency bound does not scale with
+                // the buffer size.
+                ReadTotalTimeoutMultiplier: 0,
+                ReadTotalTimeoutConstant: coalesce_ms,
+                // Writes keep the port's configured timeout. See the module docs.
+                WriteTotalTimeoutMultiplier: 0,
+                WriteTotalTimeoutConstant: write_timeout_ms,
+            },
+        )
+    }
 
+    /// Program `handle`'s device to return IMMEDIATELY with whatever is already
+    /// buffered, even if that is nothing. This is the drain probe's timeout form.
+    ///
+    /// `ReadIntervalTimeout = MAXDWORD` with BOTH total-timeout fields zero is
+    /// the exact combination the `COMMTIMEOUTS` documentation defines as "return
+    /// immediately with the bytes that have already been received, even if no
+    /// bytes have been received". Both zeros are load-bearing: a non-zero
+    /// constant would let the read block for that long when the buffer is empty,
+    /// and at ~400 bytes/ms the probe would then find bytes essentially every
+    /// time and report that no read ever drains the port — a false negative
+    /// manufactured by the instrument.
+    ///
+    /// Note this differs from what `serialport`'s `set_timeout` writes
+    /// (`Multiplier = MAXDWORD`, `Constant = timeout`). The documented zero-wait
+    /// form is required, not an approximation of it — which is why the probe
+    /// cannot simply call `set_timeout(Duration::ZERO)` the way the unix path
+    /// does.
+    pub(super) fn apply_immediate(handle: isize, write_timeout_ms: u32) -> Result<()> {
+        set(
+            handle,
+            &COMMTIMEOUTS {
+                ReadIntervalTimeout: u32::MAX,
+                ReadTotalTimeoutMultiplier: 0,
+                ReadTotalTimeoutConstant: 0,
+                WriteTotalTimeoutMultiplier: 0,
+                WriteTotalTimeoutConstant: write_timeout_ms,
+            },
+        )
+    }
+
+    fn set(handle: isize, timeouts: &COMMTIMEOUTS) -> Result<()> {
         // `HANDLE` is a plain `isize` in windows-sys 0.52 (the version pinned
         // in Cargo.toml, and the one serialport itself uses), so the stored
         // handle is passed through without a cast.
         let handle: HANDLE = handle;
 
-        // SAFETY: `handle` is the raw handle of the `COMPort` owned by this
-        // `Ppk2`'s `port` field, which outlives every call site (both are on
-        // the main thread, with `self` borrowed). `timeouts` is a fully
-        // initialized `#[repr(C)]` `COMMTIMEOUTS` and is only read by the call.
-        if unsafe { SetCommTimeouts(handle, &timeouts) } == 0 {
+        // SAFETY: every call site passes the raw handle of a `COMPort` it owns
+        // or that is owned by a value outliving the call — the main thread's
+        // `Ppk2::port`, or the measurement worker's own cloned port, which the
+        // worker holds for its entire life. `timeouts` is a fully initialized
+        // `#[repr(C)]` `COMMTIMEOUTS` and is only read by the call.
+        if unsafe { SetCommTimeouts(handle, timeouts) } == 0 {
             return Err(Error::Io(io::Error::last_os_error()));
         }
         Ok(())
@@ -273,10 +262,48 @@ pub enum Error {
     WorkerSignalError(#[from] TryRecvError),
     #[error("Error deserializeing a measurement: {0:?}")]
     DeserializeMeasurement(Vec<u8>),
+    /// The measurement stream went silent and stayed silent.
+    ///
+    /// A single empty read is routine — see [`stream::SilenceGuard`] — so this
+    /// is only produced after sustained silence, and it means the device stopped
+    /// streaming or went away rather than that any one read failed.
+    #[error(
+        "PPK2 stream is dead: {reads} consecutive reads returned no data over {elapsed:?} \
+         (port read timeout is {timeout:?}). The device stopped streaming or was \
+         disconnected; the measurement worker gave up rather than spin on an empty port."
+    )]
+    StreamDead {
+        /// Consecutive reads that returned no data.
+        reads: u32,
+        /// How long the port had been silent when the worker gave up.
+        elapsed: Duration,
+        /// The port's configured read timeout, for judging whether `reads` and
+        /// `elapsed` are consistent with each other.
+        timeout: Duration,
+    },
 }
 
 #[allow(missing_docs)]
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The concrete port type a [`Ppk2`] holds open.
+///
+/// On Windows this is deliberately the NATIVE `COMPort` rather than a
+/// `Box<dyn SerialPort>`: the measurement worker's drain probe has to call
+/// `SetCommTimeouts`, which needs a raw handle, and the only way to give the
+/// worker a handle whose lifetime it controls is `COMPort::try_clone_native`.
+/// A `Box<dyn SerialPort>` cannot produce one.
+///
+/// Storing a raw handle from the MAIN thread's port instead (what this crate
+/// used to do) would be a use-after-free waiting to happen: dropping the `stop`
+/// closure without calling it drops the `Ppk2`, closing that handle while the
+/// worker is still mid-read, and Windows recycles handle values.
+#[cfg(windows)]
+type OwnedPort = serialport::COMPort;
+/// The concrete port type a [`Ppk2`] holds open. See the Windows variant for why
+/// this is a type alias at all.
+#[cfg(not(windows))]
+type OwnedPort = Box<dyn SerialPort>;
 
 /// PPK2 device representation.
 ///
@@ -305,7 +332,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// # }
 /// ```
 pub struct Ppk2 {
-    port: Box<dyn SerialPort>,
+    port: OwnedPort,
     metadata: Metadata,
     /// Set by the `stop` closure of [`Ppk2::start_measurement_matching`] when
     /// the measurement worker ended abnormally (returned an error or panicked).
@@ -315,16 +342,6 @@ pub struct Ppk2 {
     /// handle is unusable" are independent facts, and the caller usually needs
     /// the handle precisely to make the hardware safe.
     last_worker_error: Option<Error>,
-    /// Windows only: the raw handle backing `port`, kept as an `isize` so this
-    /// struct stays `Send` (a `RawHandle` is a raw pointer and would silently
-    /// make `Ppk2` un-sendable for downstream callers).
-    ///
-    /// Needed because [`win_read_coalescing`] programs the driver through
-    /// `SetCommTimeouts`, which the `SerialPort` trait object cannot expose.
-    /// Only ever used while `port` is alive and borrowed, so it is never
-    /// dangling — see the SAFETY note at the call.
-    #[cfg(windows)]
-    native_handle: isize,
 }
 
 impl Ppk2 {
@@ -334,19 +351,13 @@ impl Ppk2 {
             .timeout(Duration::from_millis(500))
             .flow_control(FlowControl::Hardware);
 
-        // On Windows open the NATIVE port type rather than a trait object, so
-        // the raw handle can be captured before boxing. `win_read_coalescing`
-        // needs it to call `SetCommTimeouts`, and the `SerialPort` trait
-        // exposes no way to recover a handle from a `Box<dyn SerialPort>`.
+        // On Windows keep the NATIVE port type rather than a trait object. See
+        // [`OwnedPort`]: `SetCommTimeouts` needs a raw handle, and only the
+        // native type can hand one out — or clone itself into another one.
         #[cfg(windows)]
-        let (mut port, native_handle): (Box<dyn SerialPort>, isize) = {
-            use std::os::windows::io::AsRawHandle;
-            let native = builder.open_native()?;
-            let handle = native.as_raw_handle() as isize;
-            (Box::new(native), handle)
-        };
+        let mut port: OwnedPort = builder.open_native()?;
         #[cfg(not(windows))]
-        let mut port: Box<dyn SerialPort> = builder.open()?;
+        let mut port: OwnedPort = builder.open()?;
 
         if let Err(e) = port.clear(serialport::ClearBuffer::All) {
             tracing::warn!("failed to clear buffers: {:?}", e);
@@ -361,8 +372,6 @@ impl Ppk2 {
             port,
             metadata: Metadata::default(),
             last_worker_error: None,
-            #[cfg(windows)]
-            native_handle,
         };
 
         // A prior client may have crashed mid-stream, leaving the device
@@ -581,45 +590,73 @@ impl Ppk2 {
         let (sig_tx, sig_rx) = mpsc::channel::<()>();
 
         let task_ready = ready.clone();
-        let mut port = self.port.try_clone()?;
         let metadata = self.metadata.clone();
+
+        // The worker gets its OWN handle to the port. On Windows that clone is
+        // NATIVE, so the raw handle the drain probe needs belongs to the port the
+        // worker owns and cannot outlive it. Deriving it from `self.port` instead
+        // would leave the worker calling `SetCommTimeouts` on a closed handle
+        // whenever the caller drops the `stop` closure without calling it — and
+        // Windows recycles handle values.
+        #[cfg(windows)]
+        let (mut port, worker_handle): (Box<dyn SerialPort>, isize) = {
+            use std::os::windows::io::AsRawHandle;
+            let native = self.port.try_clone_native()?;
+            let handle = native.as_raw_handle() as isize;
+            (Box::new(native), handle)
+        };
+        #[cfg(not(windows))]
+        let mut port: Box<dyn SerialPort> = self.port.try_clone()?;
+
+        // Every `COMMTIMEOUTS` form written from here on preserves this, so a
+        // concurrent `Ppk2Commander` write — which carries
+        // `set_device_power(Disabled)` — keeps its normal budget no matter what
+        // the read path is doing.
+        #[cfg(windows)]
+        let write_timeout_ms = u32::try_from(self.port.timeout().as_millis()).unwrap_or(u32::MAX);
 
         // Ask the OS serial driver to batch reads for the duration of the
         // stream. See the `win_read_coalescing` module docs: this governs every
-        // handle to the port, including the clone above and any
-        // `Ppk2Commander`, so it is applied once here on the main thread while
-        // the worker is still parked on the condvar.
+        // handle to the port, so applying it through the worker's clone here on
+        // the main thread — while the worker is still parked on the condvar —
+        // governs the commander's handle too.
         //
-        // Failure is not fatal — it only means reads keep arriving in the
-        // small pieces serialport's default timeouts produce, which is what the
-        // userspace accumulation in the worker exists to absorb.
+        // Failure is not fatal: it only means reads keep arriving in the small
+        // pieces serialport's default timeouts produce. Those are still
+        // classified and placed correctly, just more of them.
         #[cfg(windows)]
-        let native_read_coalescing = {
-            let write_timeout_ms =
-                u32::try_from(self.port.timeout().as_millis()).unwrap_or(u32::MAX);
-            match win_read_coalescing::apply(
-                self.native_handle,
-                WIN_READ_COALESCE_MS,
-                write_timeout_ms,
-            ) {
+        let native_read_coalescing =
+            match win_read_coalescing::apply(worker_handle, WIN_READ_COALESCE_MS, write_timeout_ms)
+            {
                 Ok(()) => true,
                 Err(e) => {
-                    tracing::warn!(
-                        "failed to enable native read coalescing ({:?}); \
-                         falling back to userspace read accumulation",
-                        e
-                    );
+                    tracing::warn!("failed to enable native read coalescing ({:?})", e);
                     false
                 }
-            }
+            };
+
+        // How many bytes to ask for per read. On Windows the driver coalesces,
+        // and asking for exactly the batch we want makes the BYTE count the
+        // binding constraint (see `WIN_READ_LEN_BYTES`). Everywhere else the
+        // driver caps the read at its own transfer size regardless — measured at
+        // 1020 B on macOS against a 4096 B request — so asking for the whole
+        // buffer costs nothing.
+        #[cfg(windows)]
+        let read_len = if native_read_coalescing {
+            WIN_READ_LEN_BYTES.min(USB_READ_BUF_BYTES)
+        } else {
+            USB_READ_BUF_BYTES
         };
         #[cfg(not(windows))]
-        let native_read_coalescing = false;
+        let read_len = USB_READ_BUF_BYTES;
 
         let t = thread::spawn(move || {
             let r = || -> Result<()> {
-                // Create an accumulator with the current device metadata
-                let mut accumulator = MeasurementAccumulator::new(metadata);
+                // Owns the parser, the held-sample ring, the skipped-sample
+                // accounting, the stall guard and the seam guard. See
+                // `crate::stream` for why the timebase lives in one testable
+                // place rather than being spread through this loop.
+                let mut assembler = StreamAssembler::new(metadata, sps, pins);
                 // First wait for main thread to clear
                 // serial port input buffer
                 let (lock, cvar) = &*task_ready;
@@ -627,41 +664,35 @@ impl Ppk2 {
                     .wait_while(lock.lock().unwrap(), |ready| !*ready)
                     .unwrap();
 
-                /* A single PPK2 sample is 4 bytes and the device streams up to 100,000 samples/sec.
-                   We read into a reusable USB_READ_BUF_BYTES buffer and feed the exact number of
-                   bytes accumulated to the accumulator. `port.read()` returns whatever bytes are
-                   currently available (it does NOT wait to fill the buffer), and on Windows that is
-                   often only a handful — so each iteration keeps reading into the remaining buffer
-                   space until READ_ACCUM_TARGET_BYTES / READ_ACCUM_WINDOW / buffer-full, then parses
-                   and emits the whole accumulation at once. The accumulator carries a partial-sample
-                   remainder internally, so feeding any byte count is correctness-preserving.
+                /* A single PPK2 sample is 4 bytes and the device streams ~400 bytes/ms
+                   continuously. Each iteration performs exactly ONE blocking read, then ONE
+                   strictly non-blocking follow-up read (the drain probe) that answers the only
+                   question that matters for placing the samples in time: was anything still
+                   queued behind them?
 
-                   The driver decimates by AVERAGING `SPS_MAX/sps` parsed samples into one output via
-                   `combine_matching`. The drain below pulls samples in FIXED `chunk`-sized units in a
-                   while-loop, so each emitted measurement always averages exactly `chunk` samples
-                   regardless of how many bytes the last `read()` delivered. Leftover samples
-                   (< chunk) stay in `measurement_buf` for the next read. This decouples the averaging
-                   window from the USB read size — read buffer size never changes decimated output.
+                   The probe is not an optimisation and its result is not advisory. A read that
+                   drained the port dates its own last sample; a read that swept up a backlog
+                   dates nothing at all, and its samples have to be held until a draining read
+                   arrives to pin them against. Measured on macOS under CPU saturation, 61.65%
+                   of samples arrive on the second path.
+
+                   Note what is NOT here any more: the userspace read accumulation that used to
+                   merge several reads into one emission. It cannot coexist with this design —
+                   merging reads destroys exactly the per-read drain observation the timebase is
+                   built on, and its `set_timeout` calls clobbered the Windows COMMTIMEOUTS. The
+                   assembler batches instead, by holding samples it cannot yet place.
                 */
                 let mut buf = [0u8; USB_READ_BUF_BYTES];
-                let mut measurement_buf = VecDeque::with_capacity(SPS_MAX);
-                let mut missed = 0;
+                let mut probe_buf = [0u8; USB_READ_BUF_BYTES];
+                let mut out: Vec<MeasurementMatch> = Vec::new();
 
-                // How many bytes to ask for per read. With native coalescing a
-                // read ends at whichever comes first: this many bytes, or the
-                // driver's few-millisecond window. Asking for exactly the batch
-                // we want makes the BYTE count the binding constraint at full
-                // rate, so the cadence is ~5 ms of stream per read regardless of
-                // the system timer granularity that governs the window (a 5 ms
-                // COMMTIMEOUTS constant can round up to a ~15 ms tick, which
-                // against the full 4 KB buffer would let a read cover ~10 ms).
-                // Without coalescing this is the whole buffer, exactly as
-                // before, and the userspace accumulation bounds the batch.
-                let read_len = if native_read_coalescing {
-                    READ_ACCUM_TARGET_BYTES.min(buf.len())
-                } else {
-                    buf.len()
-                };
+                // Backstop against a device that stops streaming and never
+                // resumes. See `SilenceGuard`: an empty read on its own is
+                // routine and must not be fatal, but spinning on an empty port
+                // forever is not an option either.
+                let mut silence = SilenceGuard::new(Instant::now());
+                let port_timeout = port.timeout();
+
                 loop {
                     // Check whether the main thread has signaled
                     // us to stop
@@ -671,208 +702,105 @@ impl Ppk2 {
                         Err(e) => return Err(e.into()),
                     }
 
-                    // Now we read chunks and feed them to the accumulator.
-                    //
-                    // FIRST read: blocking. Nothing is held yet, so its
-                    // semantics are exactly what they were before reads were
-                    // batched — every error propagates — with ONE exception,
-                    // below.
-                    let mut filled = match port.read(&mut buf[..read_len]) {
+                    let filled = match port.read(&mut buf[..read_len]) {
                         Ok(n) => n,
-                        // With native coalescing the read is bounded by a few
-                        // milliseconds rather than the port's timeout, so an
-                        // empty return means only "nothing arrived in the last
-                        // coalescing window" — the normal state whenever the
-                        // device is between bursts, and in particular before
-                        // `AverageStart` reaches it. Treat it as no data and
-                        // go round again (which re-checks the stop signal);
-                        // killing the stream over it would make the worker die
-                        // milliseconds after it started.
+                        // An empty read is NOT an error. On Windows 3.75% of
+                        // reads return zero bytes with `TimedOut` as a matter of
+                        // routine, and on macOS one errored read is the measured
+                        // signature of a host suspend — which fires roughly every
+                        // 4 minutes on a sleeping laptop, ~200 times overnight.
                         //
-                        // Without native coalescing this arm is never taken and
-                        // a timeout stays fatal exactly as before.
-                        Err(e) if native_read_coalescing && e.kind() == io::ErrorKind::TimedOut => {
-                            continue
+                        // This used to be fatal on every platform without native
+                        // coalescing, so a suspend killed the measurement. It no
+                        // longer is: the stall guard in the assembler is what
+                        // decides whether silence cost us anything, and it can
+                        // only do that if the worker is still alive to see the
+                        // stream resume. A genuinely broken port still fails with
+                        // a different error kind and still propagates.
+                        //
+                        // What DOES end the stream is sustained silence, counted
+                        // by the guard below.
+                        Err(e) if is_empty_read(&e) => {
+                            if let Some(dead) = silence.on_empty_read(Instant::now()) {
+                                return Err(Error::StreamDead {
+                                    reads: dead.reads,
+                                    elapsed: dead.elapsed,
+                                    timeout: port_timeout,
+                                });
+                            }
+                            continue;
                         }
                         Err(e) => return Err(e.into()),
                     };
-                    // Stamp the wall clock the INSTANT the read returns, before
-                    // parsing and before anything is queued. This is the whole
-                    // point of the field: it is an upper bound on the capture
-                    // time of the samples in `buf[..filled]` that excludes the
-                    // mpsc queueing delay and the consumer's own scheduling.
-                    // Doing this any later (in the consumer, on dequeue) folds
-                    // in tens of milliseconds of scheduling jitter and destroys
-                    // the estimate. Do NOT move this below `feed_into`.
-                    //
-                    // When the accumulation below pulls in more bytes, this is
-                    // re-stamped after each successful read, so the emission
-                    // carries the LAST read's arrival. That is the required
-                    // direction: no sample may be stamped EARLIER than the read
-                    // that actually delivered its bytes, and the earlier reads
-                    // in an accumulation are strictly older than the last one.
-                    let mut read_at = SystemTime::now();
-
-                    // A continuation read may fail fatally. If it does we must
-                    // still parse and emit what we already hold before
-                    // propagating, so no delivered sample is dropped on the way
-                    // out. Deferred here, returned after the drain below.
-                    let mut fatal: Option<Error> = None;
-
-                    // ACCUMULATION: keep reading into the remaining buffer space
-                    // until we hold READ_ACCUM_TARGET_BYTES, the window expires,
-                    // or the buffer is full. Motivation and constant choices are
-                    // documented on READ_ACCUM_TARGET_BYTES; the short version is
-                    // that Windows' COMMTIMEOUTS make every read return with a
-                    // handful of bytes, and emitting per-read there fragments
-                    // delivery and the arrival timing that consumers depend on.
-                    //
-                    // Skipped in two cases:
-                    //
-                    // * The first read already met the target — the normal case
-                    //   on macOS/Linux, whose drivers return a full transfer per
-                    //   read. Those platforms take the identical code path they
-                    //   did before, with no extra read, no timeout churn, and
-                    //   the first read's stamp.
-                    // * Native read coalescing is active. The driver is then
-                    //   already doing exactly this job inside `ReadFile` —
-                    //   fill the buffer, bounded by a short window — with no
-                    //   syscalls and no timeout mutation. Running the userspace
-                    //   loop on top would be strictly worse than redundant: its
-                    //   `set_timeout` calls CLOBBER the COMMTIMEOUTS that make
-                    //   coalescing work (see `win_read_coalescing`), so the two
-                    //   mechanisms would fight, and the driver would fall back
-                    //   to returning immediately after the first accumulation.
-                    if !native_read_coalescing
-                        && filled > 0
-                        && filled < READ_ACCUM_TARGET_BYTES
-                        && filled < buf.len()
-                    {
-                        let deadline = Instant::now() + READ_ACCUM_WINDOW;
-                        let port_timeout = port.timeout();
-                        // Best-effort: if the timeout cannot be shortened, skip
-                        // accumulating rather than risk blocking for the port's
-                        // full timeout with parsed-able bytes already in hand.
-                        if port.set_timeout(READ_ACCUM_POLL_TIMEOUT).is_ok() {
-                            while filled < READ_ACCUM_TARGET_BYTES
-                                && filled < buf.len()
-                                && Instant::now() < deadline
-                            {
-                                match port.read(&mut buf[filled..]) {
-                                    // Nothing more to be had right now: emit
-                                    // what we hold rather than spinning.
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        filled += n;
-                                        read_at = SystemTime::now();
-                                    }
-                                    // The stream went quiet inside the window.
-                                    // End the accumulation and emit; do NOT
-                                    // retry, or a stalled device would hold
-                                    // these samples for the whole window while
-                                    // burning wakeups.
-                                    Err(e)
-                                        if matches!(
-                                            e.kind(),
-                                            io::ErrorKind::TimedOut
-                                                | io::ErrorKind::WouldBlock
-                                                | io::ErrorKind::Interrupted
-                                        ) =>
-                                    {
-                                        break
-                                    }
-                                    // Real failure (disconnect, etc.). Emit
-                                    // first, then propagate below.
-                                    Err(e) => {
-                                        fatal = Some(e.into());
-                                        break;
-                                    }
-                                }
-                            }
-                            // Always restore, including on the fatal path. On
-                            // Windows this timeout is device-wide rather than
-                            // per-handle (see READ_ACCUM_POLL_TIMEOUT), so it is
-                            // also what `Ppk2Commander` sees and what the device
-                            // is left with after the worker exits — and
-                            // `take_last_worker_error`'s contract promises the
-                            // returned device is fully usable, metadata reads
-                            // included, no matter how the worker ended.
-                            //
-                            // Every exit from this loop passes through here, so
-                            // the only way to leak the shortened timeout is a
-                            // panic between the two `set_timeout` calls. Nothing
-                            // in the loop can panic: `filled` is held below
-                            // `buf.len()` by the loop condition so the slice
-                            // index is always valid, and the remaining calls are
-                            // all `Result`-returning or infallible. If a
-                            // fallible-in-a-new-way operation is ever added
-                            // here, convert this into an RAII guard rather than
-                            // relying on that argument.
-                            if let Err(e) = port.set_timeout(port_timeout) {
-                                tracing::warn!("failed to restore port timeout: {:?}", e);
-                            }
+                    // A zero-length `Ok` is the same event as an empty-kind
+                    // error, just reported differently by the platform, and it
+                    // must count the same way. Left uncounted it would be the one
+                    // path that can spin without bound: a disconnected tty whose
+                    // `poll` reports ready and whose `read` then returns 0.
+                    if filled == 0 {
+                        if let Some(dead) = silence.on_empty_read(Instant::now()) {
+                            return Err(Error::StreamDead {
+                                reads: dead.reads,
+                                elapsed: dead.elapsed,
+                                timeout: port_timeout,
+                            });
                         }
+                        continue;
                     }
 
-                    missed += accumulator.feed_into(&buf[..filled], &mut measurement_buf);
-                    // Emit in fixed-size decimation units so each averaged output
-                    // covers exactly `chunk` samples regardless of read size.
-                    //
-                    // INVARIANT (consumers depend on this — do not break it):
-                    // summing the `missed` field of EVERY emitted
-                    // `MeasurementMatch` yields the exact total number of raw
-                    // samples the device skipped, with no double-counting and
-                    // no silent loss. That holds because `missed` accumulates
-                    // across reads while nothing is emitted, is handed to
-                    // `combine_matching` (which propagates it into BOTH the
-                    // `Match` and `NoMatch` variants), and is reset to 0 ONLY
-                    // after a successful send. Any future edit that resets,
-                    // skips, or conditionally forwards `missed` will make
-                    // consumers' synthesized timelines drift early.
-                    //
-                    // `read_at` is orthogonal to that accounting: it is stamped
-                    // per ACCUMULATION (at its last successful read) and
-                    // forwarded to every chunk emitted from this iteration, so
-                    // it neither contributes to nor is consumed by the `missed`
-                    // sum above.
-                    //
-                    // Note a chunk can SPAN two reads: leftover samples below
-                    // `chunk` stay in `measurement_buf` and are completed by the
-                    // next read, and such a chunk is emitted here with the LATER
-                    // (current) read's `read_at`. That is intentional — see the
-                    // field docs on `MeasurementMatch::Match::read_at`. The
-                    // stamp must never under-state arrival, so the later read
-                    // is the correct one to attribute.
-                    let chunk = (SPS_MAX / sps).max(1);
-                    while measurement_buf.len() >= chunk {
-                        let measurement = measurement_buf
-                            .drain(..chunk)
-                            .combine_matching(missed, read_at, pins);
+                    // Both clocks, the INSTANT the read returns: before the
+                    // probe, before parsing, before anything is queued. Every
+                    // sample this read delivered is placed relative to this pair,
+                    // so anything folded in here is folded into the timebase.
+                    let clocks = ReadClocks::now();
+                    // Data arrived, so the stream is alive; reuse the monotonic
+                    // stamp just taken rather than paying for another syscall.
+                    silence.on_data(clocks.mono);
+
+                    #[cfg(windows)]
+                    let (probe_filled, probe_err) = drain_probe(
+                        &mut port,
+                        &mut probe_buf,
+                        worker_handle,
+                        write_timeout_ms,
+                        native_read_coalescing,
+                    );
+                    #[cfg(not(windows))]
+                    let (probe_filled, probe_err) = drain_probe(&mut port, &mut probe_buf);
+
+                    // A probe that failed leaves drainage UNKNOWN, and an unknown
+                    // is not a drain: the read is treated as un-anchorable rather
+                    // than optimistically trusted. Any bytes it did return are
+                    // still stream data and are still passed on — discarding them
+                    // would be silent sample loss.
+                    if let Some(e) = &probe_err {
+                        tracing::debug!(
+                            "drain probe failed ({:?}); treating the read as un-anchorable",
+                            e
+                        );
+                    }
+                    let trustable = probe_err.is_none() && probe_indicates_drained(probe_filled);
+
+                    out.clear();
+                    assembler.on_read(
+                        clocks,
+                        &buf[..filled],
+                        &probe_buf[..probe_filled],
+                        trustable,
+                        &mut out,
+                    );
+
+                    for m in out.drain(..) {
                         // A send failure here has exactly one cause: the
                         // `Receiver` was dropped. That is a request to stop,
                         // not a fault — nobody wants measurements any more —
                         // so exit cleanly instead of reporting an error.
-                        if meas_tx.send(measurement).is_err() {
+                        if meas_tx.send(m).is_err() {
                             tracing::debug!(
                                 "Measurement receiver dropped; stopping the measurement worker"
                             );
                             return Ok(());
                         }
-                        missed = 0;
-                    }
-
-                    // A continuation read failed fatally. Everything it had
-                    // already delivered has now been parsed and emitted above,
-                    // so the error can propagate without losing samples.
-                    //
-                    // This deliberately sits AFTER the drain, which means a
-                    // `Receiver` dropped in the same iteration wins and returns
-                    // `Ok(())` instead: if nobody wants the measurements any
-                    // more, the read error that ended the stream is moot, and
-                    // reporting it would turn a benign shutdown into a recorded
-                    // worker error. Keep this ordering.
-                    if let Some(e) = fatal {
-                        return Err(e);
                     }
                 }
             };
@@ -939,6 +867,13 @@ impl Ppk2 {
             // Re-asserting the SAME timeout is not a no-op: `set_timeout`
             // unconditionally rewrites COMMTIMEOUTS, which is exactly how it
             // clobbers our settings elsewhere. Here that is the point.
+            //
+            // Windows-only: nothing else in the stream leaves device-wide state
+            // behind. The drain probe rewrites COMMTIMEOUTS on every read but
+            // always restores whichever form governs the main read before it
+            // returns, and on unix the probe's timeout is per-object and dies
+            // with the worker's cloned port.
+            #[cfg(windows)]
             if native_read_coalescing {
                 let timeout = self.port.timeout();
                 if let Err(e) = self.port.set_timeout(timeout) {
@@ -1108,6 +1043,109 @@ impl Ppk2Commander {
     pub fn set_device_power(&mut self, power: DevicePower) -> Result<()> {
         self.write_zero_response_command(Command::DeviceRunningSet(power))
     }
+}
+
+/// Whether an `io::Error` from a read means "nothing was waiting" rather than
+/// "the port is broken".
+///
+/// All three kinds mean the same thing here: the read consumed nothing and the
+/// caller may simply go round again. `TimedOut` in particular is ROUTINE, not
+/// exceptional — 3.75% of Windows reads return zero bytes with it, and it is the
+/// strongest drain signal the platform offers.
+fn is_empty_read(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
+
+/// Issue the strictly non-blocking follow-up read that decides whether the
+/// preceding read drained the port.
+///
+/// Returns `(bytes_read, error)`. Both may be meaningful at once: a probe that
+/// read bytes and then failed to restore the port's timeouts reports both, and
+/// the bytes are still the caller's to keep. **Probe bytes are real stream data
+/// and must never be discarded** — they are simply the newest samples in the
+/// stream.
+///
+/// The probe MUST be strictly non-blocking. The PPK2 streams ~400 bytes per
+/// millisecond, so even a 1 ms wait would find bytes essentially every time and
+/// report that no read ever drains the port — a false negative manufactured by
+/// the instrument, which would push every sample onto the backward-pinning path.
+///
+/// A small non-zero result does occur occasionally even on a port that had in
+/// fact drained, because the probe costs a syscall during which ~4 bytes arrive
+/// every 10 µs. It is NOT tolerated: [`probe_indicates_drained`] requires a
+/// strict zero, so such a read is placed by backward pinning instead of
+/// anchoring itself. See that function for why the obvious 64-byte tolerance is
+/// the wrong trade on macOS.
+///
+/// # Windows
+///
+/// Programs the documented zero-wait `COMMTIMEOUTS` form directly rather than
+/// calling `set_timeout(Duration::ZERO)`, which writes a different (and merely
+/// approximate) combination — see [`win_read_coalescing::apply_immediate`]. The
+/// write timeout is preserved throughout, so a concurrent [`Ppk2Commander`] is
+/// never affected.
+#[cfg(windows)]
+fn drain_probe(
+    port: &mut Box<dyn SerialPort>,
+    buf: &mut [u8],
+    handle: isize,
+    write_timeout_ms: u32,
+    native_read_coalescing: bool,
+) -> (usize, Option<Error>) {
+    if let Err(e) = win_read_coalescing::apply_immediate(handle, write_timeout_ms) {
+        return (0, Some(e));
+    }
+    let res = port.read(buf);
+
+    // Restore whatever governs the MAIN read. Without this the next blocking
+    // read would return immediately with nothing, forever.
+    let restore = if native_read_coalescing {
+        win_read_coalescing::apply(handle, WIN_READ_COALESCE_MS, write_timeout_ms)
+    } else {
+        let timeout = port.timeout();
+        port.set_timeout(timeout).map_err(Error::from)
+    };
+
+    let (n, mut err) = match res {
+        Ok(n) => (n, None),
+        // "Nothing was waiting" is the probe's SUCCESS case: the preceding read
+        // drained the port.
+        Err(e) if is_empty_read(&e) => (0, None),
+        Err(e) => (0, Some(Error::from(e))),
+    };
+    if let Err(e) = restore {
+        let _ = err.get_or_insert(e);
+    }
+    (n, err)
+}
+
+/// See the Windows variant. On unix the same effect is had by shortening the
+/// port timeout to zero, since the backend `poll`s with it before reading — and
+/// unlike Windows that timeout is per-object, so it cannot disturb any other
+/// handle to the same device.
+#[cfg(not(windows))]
+fn drain_probe(port: &mut Box<dyn SerialPort>, buf: &mut [u8]) -> (usize, Option<Error>) {
+    let original = port.timeout();
+    if let Err(e) = port.set_timeout(PROBE_TIMEOUT) {
+        return (0, Some(Error::from(e)));
+    }
+    let res = port.read(buf);
+    let restore = port.set_timeout(original);
+
+    let (n, mut err) = match res {
+        Ok(n) => (n, None),
+        // "Nothing was waiting" is the probe's SUCCESS case: the preceding read
+        // drained the port.
+        Err(e) if is_empty_read(&e) => (0, None),
+        Err(e) => (0, Some(Error::from(e))),
+    };
+    if let Err(e) = restore {
+        let _ = err.get_or_insert(Error::from(e));
+    }
+    (n, err)
 }
 
 /// Render a [`thread::JoinHandle::join`] panic payload as a human-readable
