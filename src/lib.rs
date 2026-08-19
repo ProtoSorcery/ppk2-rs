@@ -3,7 +3,7 @@
 
 use measurement::MeasurementMatch;
 use serialport::{ClearBuffer::Input, FlowControl, SerialPort};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::str::Utf8Error;
 use std::sync::mpsc::{self, Receiver, SendError, TryRecvError};
 use std::{
